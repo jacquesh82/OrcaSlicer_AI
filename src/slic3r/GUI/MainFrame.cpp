@@ -56,6 +56,7 @@
 #include "GUI_Factories.hpp"
 #include "GUI_ObjectList.hpp"
 #include "NotificationManager.hpp"
+#include "slic3r/plugin/PluginManager.hpp"
 #include "MarkdownTip.hpp"
 #include "NetworkTestDialog.hpp"
 #include "ConfigWizard.hpp"
@@ -1939,6 +1940,16 @@ wxBoxSizer* MainFrame::create_side_tools()
     m_print_btn = new SideButton(print_panel, _L("Print plate"), "");
     m_print_option_btn = new SideButton(print_panel, "", "sidebutton_dropdown", 0, 14);
 
+    // AI optimisation: plugin copilot entry point, left of the slice button.
+    auto ai_panel = new wxPanel(this, wxID_ANY, wxDefaultPosition, wxDefaultSize);
+    ai_panel->SetBackgroundColour(StateColor::darkModeColorFor(wxColour("#3B4446")));
+    m_ai_btn = new SideButton(ai_panel, _L("AI optimisation"), "");
+    m_ai_option_btn = new SideButton(ai_panel, "", "sidebutton_dropdown", 0, 14);
+    auto ai_sizer = new wxBoxSizer(wxHORIZONTAL);
+    ai_sizer->Add(m_ai_btn, 0, wxRIGHT | wxALIGN_CENTER_VERTICAL, FromDIP(1));
+    ai_sizer->Add(m_ai_option_btn, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(1));
+    ai_panel->SetSizer(ai_sizer);
+
     auto slice_sizer = new wxBoxSizer(wxHORIZONTAL);
     slice_sizer->Add(m_slice_option_btn, 0, wxRIGHT | wxALIGN_CENTER_VERTICAL, FromDIP(1));
     slice_sizer->Add(m_slice_btn, 0, wxLEFT | wxALIGN_CENTER_VERTICAL, FromDIP(1));
@@ -1952,7 +1963,10 @@ wxBoxSizer* MainFrame::create_side_tools()
     update_side_button_style();
     m_slice_option_btn->Enable();
     m_print_option_btn->Enable();
+    m_ai_option_btn->Enable();
     //sizer->Add(FromDIP(15), 0, 0, 0, 0);
+    sizer->Add(ai_panel);
+    sizer->Add(FromDIP(15), 0, 0, 0, 0);
     sizer->Add(slice_panel);
     sizer->Add(FromDIP(15), 0, 0, 0, 0);
     sizer->Add(print_panel);
@@ -2097,6 +2111,37 @@ wxBoxSizer* MainFrame::create_side_tools()
             m_slice_option_pop_up->Popup(m_slice_btn);
         }
     );
+
+    // AI optimisation: both the label and the chevron open the same two options.
+    // There is no default action on the label on purpose -- each option spends
+    // agent tokens, so the choice must stay explicit.
+    auto show_ai_popup = [this](wxCommandEvent&) {
+        if (m_ai_option_pop_up)
+            delete m_ai_option_pop_up;
+        m_ai_option_pop_up = new SidePopup(this);
+
+        SideButton* auto_btn = new SideButton(m_ai_option_pop_up, _L("Automatic"), "");
+        auto_btn->SetCornerRadius(0);
+        SideButton* chat_btn = new SideButton(m_ai_option_pop_up, _L("Chatbot"), "");
+        chat_btn->SetCornerRadius(0);
+
+        auto_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            if (m_ai_option_pop_up)
+                m_ai_option_pop_up->Dismiss();
+            run_ai_copilot(wxString("Orca Copilot Auto"));
+        });
+        chat_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            if (m_ai_option_pop_up)
+                m_ai_option_pop_up->Dismiss();
+            run_ai_copilot(wxString("Orca Copilot"));
+        });
+
+        m_ai_option_pop_up->append_button(auto_btn);
+        m_ai_option_pop_up->append_button(chat_btn);
+        m_ai_option_pop_up->Popup(m_ai_btn);
+    };
+    m_ai_btn->Bind(wxEVT_BUTTON, show_ai_popup);
+    m_ai_option_btn->Bind(wxEVT_BUTTON, show_ai_popup);
 
     m_print_option_btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent& event)
         {
@@ -2446,6 +2491,22 @@ bool MainFrame::get_enable_print_status()
     return enable;
 }
 
+void MainFrame::run_ai_copilot(const wxString& capability_name)
+{
+    // Runs on the UI thread; the capability's execute() is the fast part
+    // (open the side panel, spawn the agent session on its own thread).
+    std::string error;
+    const auto  result = Slic3r::PluginManager::instance().run_script_capability(
+        "orca_copilot", capability_name.utf8_string(), error);
+    if (result.status != Slic3r::PluginResult::Success) {
+        wxMessageDialog dlg(
+            this,
+            wxString::Format(_L("Cannot start Orca Copilot:\n\n%s"), from_u8(error.empty() ? result.message : error)),
+            _L("AI optimisation"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+    }
+}
+
 void MainFrame::update_side_button_style()
 {
     // BBS
@@ -2474,6 +2535,15 @@ void MainFrame::update_side_button_style()
     m_slice_btn->SetCornerRadius(FromDIP(12));
     m_slice_btn->SetExtraSize(wxSize(FromDIP(38), FromDIP(10)));
     m_slice_btn->SetMinSize(wxSize(-1, FromDIP(24)));
+
+    m_ai_btn->SetTextLayout(SideButton::EHorizontalOrientation::HO_Left, FromDIP(15));
+    m_ai_btn->SetCornerRadius(FromDIP(12));
+    m_ai_btn->SetExtraSize(wxSize(FromDIP(38), FromDIP(10)));
+    m_ai_btn->SetMinSize(wxSize(-1, FromDIP(24)));
+
+    m_ai_option_btn->SetTextLayout(SideButton::EHorizontalOrientation::HO_Center);
+    m_ai_option_btn->SetCornerRadius(FromDIP(12));
+    m_ai_option_btn->SetExtraSize(wxSize(FromDIP(10), FromDIP(10)));
 
     m_slice_option_btn->SetTextLayout(SideButton::EHorizontalOrientation::HO_Center);
     m_slice_option_btn->SetCornerRadius(FromDIP(12));

@@ -415,6 +415,11 @@ public:
     SideButton* m_slice_option_btn{ nullptr };
     SideButton* m_print_btn{ nullptr };
     SideButton* m_print_option_btn{ nullptr };
+    // Plugin copilot entry point (left of the slice button): popup with the
+    // Automatic / Chatbot options, each running an Orca Copilot capability.
+    SideButton* m_ai_btn{ nullptr };
+    SideButton* m_ai_option_btn{ nullptr };
+    SidePopup*  m_ai_option_pop_up{ nullptr };
 
     SidePopup*  m_slice_option_pop_up{ nullptr };
 
@@ -425,6 +430,8 @@ public:
     bool get_enable_print_status();
     //BBS
     void update_side_button_style();
+    // Runs an Orca Copilot capability by name ("Orca Copilot" / "Orca Copilot Auto").
+    void run_ai_copilot(const wxString& capability_name);
     void update_slice_print_status(SlicePrintEventType event, bool can_slice = true, bool can_print = true);
 
 #ifdef __APPLE__
