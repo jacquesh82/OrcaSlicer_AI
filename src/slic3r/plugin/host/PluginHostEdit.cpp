@@ -4,6 +4,7 @@
 #include "slic3r/plugin/PluginAuditManager.hpp"
 
 #include <libslic3r/Config.hpp>
+#include <libslic3r/Model.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PrintConfig.hpp>
 
@@ -15,7 +16,9 @@
 
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -290,6 +293,91 @@ bool edit_can_write()
     return !plugin_key.empty() && audit.settings_write_granted(plugin_key);
 }
 
+// Plain C++ on purpose (GIL released across run_on_ui_blocking), same contract
+// as ApplyOutcome.
+struct RotateOutcome
+{
+    std::vector<int> rotated; // object indices actually rotated
+};
+
+// Runs on the UI thread. Rotation is RELATIVE, in degrees, per axis, applied to
+// every instance of each selected ModelObject. A snapshot is taken first so the
+// whole batch reverts with one Ctrl+Z.
+RotateOutcome rotate_on_ui(double deg_x, double deg_y, double deg_z, const std::vector<int>* selection, bool drop_to_bed)
+{
+    GUI::GUI_App& app = GUI::wxGetApp();
+    if (app.is_closing())
+        throw std::runtime_error("OrcaSlicer is shutting down");
+
+    GUI::Plater* plater = app.plater();
+    if (plater == nullptr)
+        throw std::runtime_error("the plater is not available yet");
+
+    Model& model = plater->model();
+    if (model.objects.empty())
+        throw std::runtime_error("the plate is empty");
+
+    // Validate the selection BEFORE touching anything: one bad index must not
+    // leave earlier objects already rotated.
+    if (selection != nullptr) {
+        for (int idx : *selection) {
+            if (idx < 0 || size_t(idx) >= model.objects.size())
+                throw std::out_of_range("object index " + std::to_string(idx) + " is out of range (0.." +
+                                        std::to_string(model.objects.size() - 1) + ")");
+        }
+    }
+
+    RotateOutcome outcome;
+    plater->take_snapshot("Rotate objects");
+    const double rad_x = deg_x * M_PI / 180.0, rad_y = deg_y * M_PI / 180.0, rad_z = deg_z * M_PI / 180.0;
+    for (int idx = 0; idx < int(model.objects.size()); ++idx) {
+        if (selection != nullptr && std::find(selection->begin(), selection->end(), idx) == selection->end())
+            continue;
+        ModelObject* obj = model.objects[size_t(idx)];
+        if (rad_x != 0.) obj->rotate(rad_x, X);
+        if (rad_y != 0.) obj->rotate(rad_y, Y);
+        if (rad_z != 0.) obj->rotate(rad_z, Z);
+        if (drop_to_bed)
+            obj->ensure_on_bed();
+        outcome.rotated.push_back(idx);
+    }
+    plater->update();
+    plater->schedule_background_process();
+    BOOST_LOG_TRIVIAL(info) << "[PLUGIN EDIT] rotated " << outcome.rotated.size() << " object(s) by ("
+                            << deg_x << ", " << deg_y << ", " << deg_z << ") degrees";
+    return outcome;
+}
+
+// orca.host.edit.rotate_objects -- relative rotation of plate objects.
+py::dict edit_rotate(const std::map<std::string, double>& degrees, py::object objects, bool drop_to_bed)
+{
+    require_settings_write();
+
+    const double deg_x = degrees.count("x") ? degrees.at("x") : 0.;
+    const double deg_y = degrees.count("y") ? degrees.at("y") : 0.;
+    const double deg_z = degrees.count("z") ? degrees.at("z") : 0.;
+    if (deg_x == 0. && deg_y == 0. && deg_z == 0.)
+        throw std::invalid_argument("rotation must have at least one non-zero axis in degrees, e.g. {\"z\": 90}");
+
+    std::vector<int> selection_storage;
+    std::vector<int>* selection = nullptr; // nullptr = every object on the plate
+    if (!objects.is_none()) {
+        selection_storage = objects.cast<std::vector<int>>();
+        if (selection_storage.empty())
+            throw std::invalid_argument("objects list is empty; pass null to rotate every object");
+        selection = &selection_storage;
+    }
+
+    RotateOutcome outcome = host_bindings::run_on_ui_blocking(
+        [deg_x, deg_y, deg_z, selection, drop_to_bed]() { return rotate_on_ui(deg_x, deg_y, deg_z, selection, drop_to_bed); });
+
+    py::dict report;
+    report["rotated"]       = outcome.rotated;
+    report["count"]         = outcome.rotated.size();
+    report["drop_to_bed"]   = drop_to_bed;
+    return report;
+}
+
 } // namespace
 
 void host_bindings::register_edit(py::module_& host)
@@ -320,6 +408,15 @@ void host_bindings::register_edit(py::module_& host)
 
     edit.def("reslice", &edit_reslice,
              "Reschedule the background slicing process.");
+
+    edit.def("rotate_objects", &edit_rotate, py::arg("rotation"), py::arg("objects") = py::none(), py::arg("drop_to_bed") = true,
+             "Rotate plate objects by RELATIVE degrees per axis: rotation={\"x\": 0, \"y\": 0, \"z\": 90} "
+             "(z is the usual plate rotation). objects is a list of object indices as reported by "
+             "orca.host.model() (null = every object on the plate). drop_to_bed (default true) puts the "
+             "rotated objects back on the build plate. Takes one undo snapshot for the whole batch "
+             "(Ctrl+Z reverts it) and reschedules slicing. Requires the settings-write permission; "
+             "returns {rotated: [indices], count: n, drop_to_bed: bool}. Refuses on an empty plate and "
+             "raises IndexError for an unknown object index.");
 }
 
 } // namespace Slic3r

@@ -30,6 +30,7 @@ OrcaSlicer standard le plugin fonctionne quand meme, en mode recommandation seul
 """
 
 import json
+import math
 import os
 import queue
 import secrets
@@ -197,10 +198,19 @@ def snapshot_model():
         return {"error": str(exc), "objects": []}
 
     objects = []
-    for obj in model.objects():
-        entry = {"name": getattr(obj, "name", ""), "volumes": [], "instances": 0}
+    for index, obj in enumerate(model.objects()):
+        entry = {"index": index, "name": getattr(obj, "name", ""), "volumes": [], "instances": 0}
         try:
             entry["instances"] = len(obj.instances())
+        except Exception:
+            pass
+        try:
+            # Rotations absolues des instances, en degres : c'est la reference
+            # pour cibler rotate_objects (rotation relative).
+            entry["instance_rotations_deg"] = [
+                [round(math.degrees(float(a)), 1) for a in inst.rotation()]
+                for inst in obj.instances()
+            ]
         except Exception:
             pass
         try:
@@ -301,8 +311,10 @@ Tu disposes d'outils MCP (prefixe mcp__orca__) branches sur la session OrcaSlice
 - get_setting_metadata : bornes, type et enum d'un reglage. Consulte-le AVANT de
   proposer une valeur, pour ne jamais proposer une valeur hors bornes.
 - get_presets : presets actifs (process / filament / imprimante) et leur etat.
-- get_model_info : geometrie de la piece chargee sur le plateau.
+- get_model_info : geometrie de la piece chargee sur le plateau (indices, rotation).
 - apply_settings : applique des reglages. L'utilisateur voit un diff et confirme.
+- rotate_objects : fait pivoter des objets du plateau (degres relatifs par axe,
+  indices d'objets optionnels). L'utilisateur voit une carte et confirme.
 
 Methode de travail :
 1. Commence par LIRE la configuration reelle avant de conclure. Ne devine jamais une
@@ -869,6 +881,51 @@ PAGE = r"""
     log.appendChild(box); scroll();
   }
 
+  // Carte de rotation : meme contrat que la carte de reglages.
+  function askRotate(req) {
+    var box = document.createElement('div');
+    box.className = 'diff';
+    var h = document.createElement('h3');
+    var axes = ['x', 'y', 'z']
+      .filter(function (a) { return (req.rotation || {})[a]; })
+      .map(function (a) { return req.rotation[a] + '\u00b0 (' + a + ')'; })
+      .join(', ');
+    var cible = req.objects && req.objects.length
+      ? req.objects.length + ' objet(s) (' + req.objects.join(', ') + ')'
+      : 'tous les objets du plateau';
+    h.textContent = 'Faire pivoter ' + cible + ' de ' + axes + ' ?';
+    box.appendChild(h);
+    if (req.reason) {
+      var w = document.createElement('div'); w.className = 'why';
+      w.textContent = req.reason; box.appendChild(w);
+    }
+    if (req.drop_to_bed) {
+      var d = document.createElement('div'); d.className = 'why';
+      d.textContent = 'Les objets pivotes seront reposes sur le plateau.';
+      box.appendChild(d);
+    }
+
+    var actions = document.createElement('div');
+    actions.className = 'actions';
+    var yes = document.createElement('button');
+    yes.className = 'primary'; yes.textContent = 'Pivoter';
+    var no = document.createElement('button');
+    no.textContent = 'Refuser';
+    function answer(ok) {
+      yes.disabled = no.disabled = true;
+      var verdict = document.createElement('span');
+      verdict.className = 'why';
+      verdict.textContent = ok ? ' pivote' : ' refuse';
+      actions.appendChild(verdict);
+      window.orca.postMessage({ command: 'rotate_response', id: req.id, approved: ok });
+    }
+    yes.onclick = function () { answer(true); };
+    no.onclick = function () { answer(false); };
+    actions.appendChild(yes); actions.appendChild(no);
+    box.appendChild(actions);
+    log.appendChild(box); scroll();
+  }
+
   window.orca.onMessage(function (m) {
     if (!m || !m.command) return;
     switch (m.command) {
@@ -905,6 +962,9 @@ PAGE = r"""
         break;
       case 'apply_request':
         askApply(m);
+        break;
+      case 'rotate_request':
+        askRotate(m);
         break;
       case 'claude_status':
         hideBusy();
@@ -1112,6 +1172,8 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
                 self._on_chat(msg.get("text", ""))
             elif command == "apply_response":
                 self._on_apply_response(msg)
+            elif command == "rotate_response":
+                self._on_rotate_response(msg)
             elif command == "claude_ready":
                 # Aller-retour par la page : l'installation de claude-code vient
                 # de finir sur un thread, ce message nous ramene sur le thread UI.
@@ -1241,6 +1303,8 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
             return snap["model"]
         if method == "apply_settings":
             return self._tool_apply(params)
+        if method == "rotate_objects":
+            return self._tool_rotate(params)
         raise ValueError("outil inconnu: %s" % method)
 
     def _tool_get_settings(self, params, snap):
@@ -1327,6 +1391,90 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
         with self._pending_lock:
             self._pending.pop(req_id, None)
         return entry["result"] or {"applied": False, "reason": "sans reponse"}
+
+    def _tool_rotate(self, params):
+        """Bloque le thread du pont jusqu'a la reponse de l'utilisateur sur la
+        carte de rotation. Memes regles que _tool_apply : permission figee sur
+        le thread UI, ecriture reelle via _on_rotate_response."""
+        if not _has_edit_api():
+            raise RuntimeError(
+                "Ce build d'OrcaSlicer est en lecture seule (orca.host.edit absent). "
+                "Explique a l'utilisateur comment orienter la piece dans la vue 3D.")
+        if not self._write_ok:
+            raise RuntimeError(
+                "L'utilisateur n'a pas accorde la permission d'ecriture a ce plugin "
+                "(Fichier > Plugins > Allow modifying settings). Explique la rotation "
+                "a faire a la main dans la vue 3D.")
+
+        rotation = params.get("rotation") or {}
+        try:
+            angles = {axis: float(rotation.get(axis, 0.0))
+                      for axis in ("x", "y", "z")}
+        except (TypeError, ValueError):
+            raise ValueError("rotation attend {\"x\": deg, \"y\": deg, \"z\": deg} en degres")
+        if not any(angles.values()):
+            raise ValueError("rotation doit avoir au moins un axe non nul, ex {\"z\": 90}")
+
+        objects = params.get("objects")
+        if objects is not None and (not isinstance(objects, list) or
+                                    not all(isinstance(i, int) for i in objects)):
+            raise ValueError("objects attend une liste d'indices (get_model_info), ou null pour tout le plateau")
+
+        drop_to_bed = bool(params.get("drop_to_bed", True))
+        if not self._snapshot.get("model", {}).get("objects"):
+            raise RuntimeError("le plateau est vide")
+
+        self._counter += 1
+        req_id = "rotate-%d" % self._counter
+        entry = {
+            "event": threading.Event(),
+            "approved": False,
+            "result": None,
+            "kind": "rotate",
+            "rotation": angles,
+            "objects": objects,
+            "drop_to_bed": drop_to_bed,
+        }
+        with self._pending_lock:
+            self._pending[req_id] = entry
+
+        self.post({"command": "rotate_request", "id": req_id,
+                   "rotation": angles, "objects": objects,
+                   "drop_to_bed": drop_to_bed,
+                   "reason": params.get("reason", "")})
+
+        if not entry["event"].wait(timeout=300):
+            raise TimeoutError("l'utilisateur n'a pas repondu a la rotation en 5 minutes")
+
+        with self._pending_lock:
+            self._pending.pop(req_id, None)
+        return entry["result"] or {"applied": False, "reason": "sans reponse"}
+
+    def _on_rotate_response(self, msg):
+        """Thread UI. C'est ici, et seulement ici, qu'on touche au modele."""
+        req_id = msg.get("id")
+        with self._pending_lock:
+            entry = self._pending.get(req_id)
+        if entry is None or entry.get("kind") != "rotate":
+            return
+
+        if not msg.get("approved"):
+            entry["approved"] = False
+            entry["result"] = {"applied": False, "reason": "refuse par l'utilisateur"}
+            entry["event"].set()
+            return
+
+        try:
+            report = orca.host.edit.rotate_objects(
+                rotation=entry["rotation"],
+                objects=entry["objects"],
+                drop_to_bed=entry["drop_to_bed"])
+            entry["result"] = {"applied": True, "report": report}
+        except Exception as exc:
+            entry["result"] = {"applied": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+            self.post({"command": "error", "text": "Rotation refusee: %s" % exc})
+        entry["approved"] = True
+        entry["event"].set()
 
 
 class OrcaCopilotAuto(OrcaCopilot):
