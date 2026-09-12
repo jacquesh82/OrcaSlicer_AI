@@ -386,11 +386,11 @@ class ClaudeSession:
             "--allowedTools",
             "mcp__orca__get_settings", "mcp__orca__get_setting_metadata",
             "mcp__orca__get_presets", "mcp__orca__get_model_info",
-            "mcp__orca__apply_settings",
+            "mcp__orca__apply_settings", "mcp__orca__rotate_objects",
             # --restricted retire Bash, les outils qui executent du code et WebFetch.
             # Il est incompatible avec --permission-mode bypassPermissions ("not
             # supported in restricted mode") : --allowedTools suffit a pre-autoriser
-            # nos 5 outils, tout le reste est hors de portee de l'agent.
+            # nos outils, tout le reste est hors de portee de l'agent.
             "--restricted",
             "--append-system-prompt", system_prompt,
         ]
@@ -1493,3 +1493,438 @@ class OrcaCopilotPlugin(orca.base):
     def register_capabilities(self):
         orca.register_capability(OrcaCopilot)
         orca.register_capability(OrcaCopilotAuto)
+        # ColorTest est defini plus bas : register_capabilities() n'est appele
+        # qu'apres le chargement complet du module, donc le nom est resolu.
+        orca.register_capability(ColorTest)
+
+
+# --------------------------------------------------------------------------
+# Macro : test des 4 couleurs de l'extrudeur 1
+#
+# Quatre lignes paralleles de 5 cm, une par slot de filament, avec entre chaque
+# la sequence de changement definie dans le profil imprimante.
+#
+# Rien n'est invente : longueur de plateau, temperatures, largeur d'extrusion et
+# sequences de demarrage/changement/fin viennent toutes de la configuration
+# active. Le G-code personnalise d'un profil est un *modele* (il contient
+# {next_extruder}, [layer_z], des conditionnelles) : il est rendu par
+# orca.host.render_gcode_template, le PlaceholderParser du slicer lui-meme.
+# --------------------------------------------------------------------------
+
+DEFAULT_LINE_LENGTH_MM = 50.0
+DEFAULT_LINE_SPACING_MM = 6.0
+COLOR_COUNT = 4
+
+
+def _first_value(raw, fallback):
+    """Les options vectorielles arrivent en "1.75,1.75,1.75" : on prend la 1re."""
+    if raw is None or raw == "":
+        return fallback
+    return raw.split(",")[0].strip()
+
+
+def _nth_value(raw, index, fallback):
+    """Valeur du slot `index`, en retombant sur la derniere si le vecteur est court."""
+    if raw is None or raw == "":
+        return fallback
+    parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
+    if not parts:
+        return fallback
+    return parts[min(index, len(parts) - 1)]
+
+
+def _as_float(text, fallback):
+    try:
+        return float(str(text).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _parse_printable_area(raw):
+    """"0x0,256x0,256x256,0x256" -> (xmin, ymin, xmax, ymax)."""
+    points = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if "x" not in chunk:
+            continue
+        try:
+            x, y = chunk.split("x", 1)
+            points.append((float(x), float(y)))
+        except ValueError:
+            continue
+    if len(points) < 3:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _line_width(settings, nozzle):
+    """initial_layer_line_width peut valoir 0 (auto) ou un pourcentage de la buse."""
+    raw = _first_value(settings.get("initial_layer_line_width"), "")
+    if raw.endswith("%"):
+        return nozzle * _as_float(raw, 100.0) / 100.0
+    width = _as_float(raw, 0.0)
+    if width <= 0:
+        return nozzle * 1.125
+    return width
+
+
+def _extrusion_per_mm(width, height, filament_diameter):
+    """Section du cordon : rectangle a bouts arrondis, le modele du slicer."""
+    section = height * (width - height) + math.pi * (height / 2.0) ** 2
+    filament_section = math.pi * (filament_diameter / 2.0) ** 2
+    if filament_section <= 0:
+        return 0.0
+    return section / filament_section
+
+
+def _render_template(template, variables, notes, label):
+    """Rend un modele du profil. En cas d'echec, on le signale au lieu de
+    produire du G-code casse silencieusement."""
+    if not template or not template.strip():
+        return ""
+    fn = getattr(orca.host, "render_gcode_template", None)
+    if fn is None:
+        notes.append("%s : orca.host.render_gcode_template absent de ce build ; "
+                     "sequence omise (le G-code du profil n'a pas ete resolu)." % label)
+        return ""
+    try:
+        return fn(template, variables)
+    except Exception as exc:
+        notes.append("%s : modele non resolu (%s). Sequence remplacee par un "
+                     "changement d'outil nu." % (label, exc))
+        return None
+
+
+def build_color_test_gcode(config):
+    """Thread UI uniquement : lit orca.host. Renvoie (gcode, notes)."""
+    bundle = orca.host.preset_bundle()
+    keys = set(bundle.full_config_keys())
+
+    def get(key, default=None):
+        return bundle.full_config_value(key) if key in keys else default
+
+    notes = []
+
+    area = _parse_printable_area(get("printable_area"))
+    if area is None:
+        raise RuntimeError("impossible de lire printable_area dans le profil imprimante")
+    xmin, ymin, xmax, ymax = area
+
+    length = float(config.get("line_length_mm", DEFAULT_LINE_LENGTH_MM))
+    spacing = float(config.get("line_spacing_mm", DEFAULT_LINE_SPACING_MM))
+
+    bed_w = xmax - xmin
+    bed_d = ymax - ymin
+    if length > bed_w - 20.0:
+        length = max(20.0, bed_w - 20.0)
+        notes.append("Longueur ramenee a %.0f mm : le plateau fait %.0f mm de large."
+                     % (length, bed_w))
+    span = spacing * (COLOR_COUNT - 1)
+    if span > bed_d - 20.0:
+        spacing = max(2.0, (bed_d - 20.0) / (COLOR_COUNT - 1))
+        span = spacing * (COLOR_COUNT - 1)
+        notes.append("Espacement ramene a %.1f mm faute de profondeur." % spacing)
+
+    cx = (xmin + xmax) / 2.0
+    cy = (ymin + ymax) / 2.0
+    x_start = cx - length / 2.0
+    x_end = cx + length / 2.0
+    y_first = cy - span / 2.0
+
+    nozzle = _as_float(_first_value(get("nozzle_diameter"), "0.4"), 0.4)
+    height = _as_float(get("initial_layer_print_height"), 0.2)
+    width = _line_width({"initial_layer_line_width": get("initial_layer_line_width")}, nozzle)
+    filament_d = _as_float(_first_value(get("filament_diameter"), "1.75"), 1.75)
+    e_per_mm = _extrusion_per_mm(width, height, filament_d)
+
+    travel_f = _as_float(get("travel_speed"), 150.0) * 60.0
+    print_f = _as_float(_first_value(get("initial_layer_speed"), "20"), 20.0) * 60.0
+
+    relative_e = str(get("use_relative_e_distances", "1")).strip() in ("1", "true", "True")
+
+    bed_temp = _as_float(_nth_value(get("hot_plate_temp_initial_layer"), 0,
+                                    _nth_value(get("hot_plate_temp"), 0, "60")), 60.0)
+
+    out = []
+    add = out.append
+    add("; ==========================================================")
+    add("; Orca Copilot - test des %d couleurs de l'extrudeur 1" % COLOR_COUNT)
+    add("; genere le %s" % time.strftime("%Y-%m-%d %H:%M"))
+    add("; process : %s" % bundle.prints.edited_preset().name)
+    add("; machine : %s" % bundle.printers.edited_preset().name)
+    add(";")
+    add("; A RELIRE AVANT IMPRESSION. Ce fichier est genere a partir de la")
+    add("; configuration active, il n'a pas ete tranche ni verifie par le slicer.")
+    add("; ==========================================================")
+    add("")
+
+    start = _render_template(get("machine_start_gcode"), {
+        "initial_extruder": 0, "initial_no_support_extruder": 0,
+        "first_layer_temperature": _as_float(_nth_value(get("nozzle_temperature_initial_layer"), 0, "220"), 220.0),
+        "first_layer_bed_temperature": bed_temp,
+        "bed_temperature": bed_temp, "layer_z": height, "layer_num": 1,
+    }, notes, "machine_start_gcode")
+    if start:
+        add("; --- machine_start_gcode (profil) ---")
+        add(start.rstrip())
+        add("")
+    elif start is None:
+        add("; machine_start_gcode du profil non resolu -- demarrage minimal")
+        add("G28 ; home")
+        add("M140 S%.0f" % bed_temp)
+        add("M190 S%.0f" % bed_temp)
+        add("")
+
+    add("G90 ; coordonnees absolues")
+    add("M83 ; extrusion relative" if relative_e else "M82 ; extrusion absolue")
+    if not relative_e:
+        add("G92 E0")
+    add("")
+
+    e_total = 0.0
+    for slot in range(COLOR_COUNT):
+        temp = _as_float(_nth_value(get("nozzle_temperature_initial_layer"), slot, "220"), 220.0)
+        ftype = _nth_value(get("filament_type"), slot, "?")
+        colour = _nth_value((get("filament_colour") or "").replace(";", ","), slot, "?")
+        y = y_first + spacing * slot
+
+        add("; ----------------------------------------------------------")
+        add("; couleur %d/%d - slot %d - %s - %s" % (slot + 1, COLOR_COUNT, slot + 1, ftype, colour))
+        add("; ----------------------------------------------------------")
+
+        if slot == 0:
+            add("M109 S%.0f ; chauffe et attend" % temp)
+        else:
+            change = _render_template(get("change_filament_gcode"), {
+                "previous_extruder": slot - 1, "next_extruder": slot,
+                "current_filament_id": slot - 1, "next_filament_id": slot,
+                "current_hotend": 0, "next_hotend": 0,
+                "current_nozzle_id": 0, "next_nozzle_id": 0,
+                "layer_num": 1, "layer_z": height, "toolchange_z": height,
+                "new_filament_temp": temp, "old_filament_temp": _as_float(
+                    _nth_value(get("nozzle_temperature_initial_layer"), slot - 1, "220"), 220.0),
+                "flush_length": 0.0, "toolchange_count": slot,
+            }, notes, "change_filament_gcode (couleur %d)" % (slot + 1))
+            add("M104 S%.0f" % temp)
+            if change:
+                add("; --- change_filament_gcode (profil) ---")
+                add(change.rstrip())
+            else:
+                add("T%d ; changement d'outil nu" % slot)
+            add("M109 S%.0f" % temp)
+
+        add("G1 Z%.3f F600" % (height + 2.0))
+        add("G1 X%.3f Y%.3f F%.0f ; approche" % (x_start, y, travel_f))
+        add("G1 Z%.3f F600" % height)
+        e_line = length * e_per_mm
+        if relative_e:
+            add("G1 X%.3f Y%.3f E%.4f F%.0f ; ligne de %.0f mm" % (x_end, y, e_line, print_f, length))
+        else:
+            e_total += e_line
+            add("G1 X%.3f Y%.3f E%.4f F%.0f ; ligne de %.0f mm" % (x_end, y, e_total, print_f, length))
+        add("G1 Z%.3f F600 ; degage" % (height + 2.0))
+        add("")
+
+    end = _render_template(get("machine_end_gcode"), {
+        "layer_z": height, "layer_num": 1, "max_layer_z": height,
+    }, notes, "machine_end_gcode")
+    if end:
+        add("; --- machine_end_gcode (profil) ---")
+        add(end.rstrip())
+    else:
+        add("; machine_end_gcode du profil non resolu -- arret minimal")
+        add("M104 S0")
+        add("M140 S0")
+        add("M84")
+
+    # La macro n'ajoute aucune ligne d'amorcage : sur la couleur 1 la buse n'est
+    # amorcee que par le machine_start_gcode du profil, et sur les suivantes par
+    # la purge du change_filament_gcode. Le dire plutot que d'inventer.
+    notes.append("Aucune ligne d'amorcage n'est ajoutee : la couleur 1 depend de "
+                 "l'amorcage du machine_start_gcode, les suivantes de la purge du "
+                 "change_filament_gcode. Si la premiere ligne sort maigre, c'est la.")
+
+    notes.insert(0, "%d lignes de %.0f mm, espacees de %.1f mm, centrees sur le plateau "
+                    "(%.0f x %.0f mm). Cordon %.2f mm de large sur %.2f mm de haut, "
+                    "%.3f mm de filament par mm de trajet."
+                 % (COLOR_COUNT, length, spacing, bed_w, bed_d, width, height, e_per_mm))
+    return "\n".join(out) + "\n", notes
+
+
+COLOR_TEST_PAGE = r"""
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--orca-bg); color: var(--orca-fg);
+    font-family: var(--orca-font, system-ui, sans-serif); font-size: 13px;
+  }
+  header { padding: 12px 14px; border-bottom: 1px solid var(--orca-border); flex: 0 0 auto; }
+  header h1 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+  .notes { color: var(--orca-muted); font-size: 11px; line-height: 1.5; }
+  .notes li { margin-bottom: 2px; }
+  .warn { color: #d9534f; }
+  pre {
+    flex: 1 1 auto; overflow: auto; margin: 0; padding: 12px;
+    font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.45;
+    white-space: pre;
+  }
+  footer {
+    flex: 0 0 auto; border-top: 1px solid var(--orca-border); padding: 10px;
+    display: flex; gap: 8px; align-items: center;
+  }
+  button {
+    font: inherit; padding: 6px 14px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--orca-border); background: transparent; color: var(--orca-fg);
+  }
+  button.primary { background: var(--orca-accent); color: var(--orca-accent-fg); border-color: transparent; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { color: var(--orca-muted); font-size: 11px; }
+</style>
+
+<header>
+  <h1>Test des 4 couleurs - extrudeur 1</h1>
+  <ul class="notes" id="notes"></ul>
+</header>
+
+<pre id="gcode">(generation...)</pre>
+
+<footer>
+  <button class="primary" id="save">Enregistrer le .gcode...</button>
+  <button id="close">Fermer</button>
+  <span id="status"></span>
+</footer>
+
+<script>
+(function () {
+  var save = document.getElementById('save');
+  var status = document.getElementById('status');
+
+  window.orca.onMessage(function (m) {
+    if (!m || !m.command) return;
+    if (m.command === 'gcode') {
+      document.getElementById('gcode').textContent = m.text;
+      var ul = document.getElementById('notes');
+      ul.replaceChildren();
+      (m.notes || []).forEach(function (n, i) {
+        var li = document.createElement('li');
+        // La premiere note est le resume des dimensions ; les suivantes sont
+        // des avertissements, donc signalees comme tels.
+        if (i > 0) li.className = 'warn';
+        li.textContent = n;
+        ul.appendChild(li);
+      });
+    } else if (m.command === 'saved') {
+      status.textContent = m.path ? ('Enregistre : ' + m.path) : 'Enregistrement annule.';
+      save.disabled = false;
+    } else if (m.command === 'error') {
+      status.textContent = m.text;
+      save.disabled = false;
+    }
+  });
+
+  save.onclick = function () {
+    save.disabled = true;
+    status.textContent = 'ouverture du dialogue...';
+    window.orca.postMessage({ command: 'save' });
+  };
+  document.getElementById('close').onclick = function () { window.orca.close(); };
+  window.orca.postMessage({ command: 'ready' });
+})();
+</script>
+"""
+
+
+class ColorTest(orca.script.ScriptPluginCapabilityBase):
+    """Genere le G-code de test, l'affiche, et n'ecrit sur disque que sur confirmation."""
+
+    def __init__(self):
+        super().__init__()
+        self.win = None
+        self.gcode = ""
+        self.notes = []
+
+    def get_name(self):
+        return "Test 4 couleurs"
+
+    def get_default_config(self):
+        return {"line_length_mm": DEFAULT_LINE_LENGTH_MM,
+                "line_spacing_mm": DEFAULT_LINE_SPACING_MM}
+
+    def execute(self):
+        if self.win is not None and self.win.is_open():
+            self.win.close()
+            self.win = None
+
+        try:
+            cfg = json.loads(self.get_config() or "{}")
+        except Exception:
+            cfg = {}
+        for key, value in self.get_default_config().items():
+            cfg.setdefault(key, value)
+
+        # Thread UI : c'est ici, et seulement ici, qu'on lit orca.host.
+        try:
+            self.gcode, self.notes = build_color_test_gcode(cfg)
+        except Exception as exc:
+            _log("generation:", traceback.format_exc())
+            return orca.ExecutionResult.failure(
+                "gcode", "Generation impossible : %s: %s" % (type(exc).__name__, exc))
+
+        self.win = orca.host.ui.create_window(
+            html=COLOR_TEST_PAGE,
+            title="Test 4 couleurs",
+            width=900,
+            height=680,
+            on_message=self.on_message,
+            on_close=self.on_close,
+            style=orca.host.ui.WINDOW_MODELESS,
+        )
+        return orca.ExecutionResult.success("G-code de test genere (%d lignes)."
+                                            % self.gcode.count("\n"))
+
+    def on_close(self, *_):
+        self.win = None
+
+    def on_unload(self):
+        if self.win is not None:
+            try:
+                if self.win.is_open():
+                    self.win.close()
+            except Exception:
+                pass
+            self.win = None
+
+    def on_message(self, msg):
+        msg = msg or {}
+        command = msg.get("command")
+        try:
+            if command == "ready":
+                self.win.post({"command": "gcode", "text": self.gcode, "notes": self.notes})
+            elif command == "save":
+                self._save()
+        except Exception as exc:
+            _log("on_message:", traceback.format_exc())
+            if self.win is not None:
+                self.win.post({"command": "error",
+                               "text": "%s: %s" % (type(exc).__name__, exc)})
+
+    def _save(self):
+        # Un plugin ne peut pas ouvrir un fichier en ecriture : l'audit hook ne lui
+        # laisse aucune racine inscriptible sous Linux. C'est l'hote qui ecrit,
+        # apres que l'utilisateur a choisi le chemin dans un dialogue natif.
+        save_file = getattr(orca.host.ui, "save_file", None)
+        if save_file is None:
+            self.win.post({"command": "error", "text":
+                           "orca.host.ui.save_file absent de ce build : selectionne le "
+                           "G-code ci-dessus et copie-le a la main."})
+            return
+        path = save_file(
+            self.gcode,
+            suggested_name="test_4_couleurs.gcode",
+            title="Enregistrer le test 4 couleurs",
+            wildcard="G-code (*.gcode)|*.gcode|Tous les fichiers (*.*)|*.*",
+        )
+        self.win.post({"command": "saved", "path": path})

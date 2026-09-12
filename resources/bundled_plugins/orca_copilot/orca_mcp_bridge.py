@@ -101,6 +101,37 @@ TOOLS = [
             "required": ["changes"],
         },
     },
+    {
+        "name": "rotate_objects",
+        "description": (
+            "Fait pivoter des objets du plateau (degres RELATIFS par axe, z etant la "
+            "rotation usuelle sur le plateau). L'utilisateur voit une carte et confirme. "
+            "Les indices d'objets et rotations absolues courantes viennent de get_model_info."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "rotation": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "number", "description": "Degres relatifs autour de X."},
+                        "y": {"type": "number", "description": "Degres relatifs autour de Y."},
+                        "z": {"type": "number", "description": "Degres relatifs autour de Z."},
+                    },
+                    "description": 'Au moins un axe non nul, ex. {"z": 90}.',
+                },
+                "objects": {
+                    "type": "array", "items": {"type": "integer"},
+                    "description": "Indices d'objets (get_model_info). Absent = tout le plateau.",
+                },
+                "drop_to_bed": {"type": "boolean", "default": True,
+                                "description": "Reposer les objets sur le plateau apres rotation."},
+                "reason": {"type": "string",
+                           "description": "Une phrase : pourquoi cette orientation."},
+            },
+            "required": ["rotation"],
+        },
+    },
 ]
 
 
@@ -109,8 +140,9 @@ def call_plugin(method, params):
     if not PORT or not TOKEN:
         raise RuntimeError("ORCA_BRIDGE_PORT / ORCA_BRIDGE_TOKEN absents de l'environnement")
     with socket.create_connection(("127.0.0.1", PORT), timeout=10) as sock:
-        # apply_settings attend une confirmation humaine : pas de timeout court.
-        sock.settimeout(360 if method == "apply_settings" else 30)
+        # apply_settings et rotate_objects attendent une confirmation humaine :
+        # pas de timeout court.
+        sock.settimeout(360 if method in ("apply_settings", "rotate_objects") else 30)
         payload = json.dumps({"token": TOKEN, "method": method, "params": params}) + "\n"
         sock.sendall(payload.encode("utf-8"))
 
