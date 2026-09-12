@@ -8,8 +8,10 @@
 #include <slic3r/GUI/GUI_App.hpp>
 #include <slic3r/GUI/MainFrame.hpp>
 #include <slic3r/GUI/MsgDialog.hpp>
+#include <slic3r/GUI/Plater.hpp>
 #include <slic3r/GUI/PluginProgressDialog.hpp>
 #include <slic3r/GUI/PluginWebDialog.hpp>
+#include <slic3r/GUI/PluginWebPanel.hpp>
 
 #include <nlohmann/json.hpp>
 #include <pybind11/pybind11.h>
@@ -327,14 +329,96 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
     return py::cast(UiWindowHandle{new_id});
 }
 
+// User clicked the AUI close button on a docked plugin pane. The pane name is
+// "plugin_panel_<registry id>", so the id parses straight out of it.
+void on_plugin_pane_closed(const wxString& pane_name)
+{
+    const wxString prefix(GUI::PLUGIN_PANE_PREFIX);
+    wxString suffix;
+    if (!pane_name.StartsWith(prefix, &suffix))
+        return;
+    long id = 0;
+    if (suffix.empty() || !suffix.ToLong(&id))
+        return;
+
+    // request_close fires the plugin's on_close (GIL-safe holder); the actual
+    // undock+destroy is deferred out of the AUI close event by the panel.
+    auto* panel = UiRegistry::instance().get_as<GUI::PluginWebPanel>(int(id));
+    GUI::PluginWebPanel::request_close(panel);
+}
+
+// orca.host.ui.create_side_panel -- same page contract and message flow as
+// create_window, but the page lives in a panel docked as a right sidebar of the
+// plater instead of a floating dialog. Absent from stock builds.
+py::object ui_create_side_panel(const std::string& html, const std::string& title, int width,
+                                py::object on_message, py::object on_close)
+{
+    auto          msg_adapter  = make_message_adapter(std::move(on_message));
+    CallablePtr   close_holder = make_holder(std::move(on_close));
+    const std::string plugin_key = PluginAuditManager::instance().current_plugin();
+
+    if (wxTheApp == nullptr)
+        throw std::runtime_error("OrcaSlicer application is not initialized");
+
+    // Same reserve-then-materialize dance as create_window: the handle is live at
+    // once, and a teardown between reserve and CallAfter cancels the creation.
+    const int new_id = UiRegistry::instance().reserve_id();
+    UiRegistry::instance().bind(new_id, nullptr, plugin_key);
+
+    GUI::wxGetApp().CallAfter([new_id, plugin_key, html, title, width,
+                               msg_adapter = std::move(msg_adapter),
+                               close_holder = std::move(close_holder)]() mutable {
+        if (!UiRegistry::instance().is_open(new_id))
+            return;
+
+        GUI::Plater* plater = GUI::wxGetApp().plater();
+        if (plater == nullptr || GUI::wxGetApp().is_closing())
+            return;
+
+        GUI::PluginWebPanel::CloseHandler on_close;
+        if (close_holder) {
+            on_close = [close_holder]() {
+                PythonGILState gil;
+                if (!gil)
+                    return;
+                try {
+                    close_holder->fn();
+                } catch (py::error_already_set& e) {
+                    BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_close handler raised: " << e.what();
+                    PyErr_Clear();
+                }
+            };
+        }
+        // Registry cleanup: GIL-free, runs from the panel destructor on every path.
+        auto on_destroyed = [new_id]() { UiRegistry::instance().remove(new_id); };
+
+        auto* panel = new GUI::PluginWebPanel(plater, html, std::move(msg_adapter),
+                                              std::move(on_close), std::move(on_destroyed));
+        const wxString pane_name = wxString(GUI::PLUGIN_PANE_PREFIX) << new_id;
+        panel->set_pane_name(pane_name);
+        UiRegistry::instance().bind(new_id, panel, plugin_key);
+        plater->set_plugin_pane_close_callback(&on_plugin_pane_closed);
+        if (!plater->dock_plugin_side_panel(panel, pane_name, wxString::FromUTF8(title), width)) {
+            // Destroy() fires on_destroyed, so the reserved id is released too.
+            panel->Destroy();
+        }
+    });
+
+    return py::cast(UiWindowHandle{new_id});
+}
+
 void handle_post(int id, py::object data)
 {
     if (wxTheApp == nullptr)
         return;
     json j = py_to_json(data); // GIL held (binding body)
     GUI::wxGetApp().CallAfter([id, j = std::move(j)]() {
-        auto* d = UiRegistry::instance().get_as<GUI::PluginWebDialog>(id);
-        GUI::PluginWebDialog::post_message(d, j);
+        if (auto* d = UiRegistry::instance().get_as<GUI::PluginWebDialog>(id)) {
+            GUI::PluginWebDialog::post_message(d, j);
+            return;
+        }
+        auto* p = UiRegistry::instance().get_as<GUI::PluginWebPanel>(id);
+        GUI::PluginWebPanel::post_message(p, j);
     });
 }
 
@@ -343,8 +427,12 @@ void handle_close(int id)
     if (wxTheApp == nullptr)
         return;
     GUI::wxGetApp().CallAfter([id]() {
-        auto* d = UiRegistry::instance().get_as<GUI::PluginWebDialog>(id);
-        GUI::PluginWebDialog::request_close(d);
+        if (auto* d = UiRegistry::instance().get_as<GUI::PluginWebDialog>(id)) {
+            GUI::PluginWebDialog::request_close(d);
+            return;
+        }
+        auto* p = UiRegistry::instance().get_as<GUI::PluginWebPanel>(id);
+        GUI::PluginWebPanel::request_close(p);
     });
 }
 
@@ -463,6 +551,14 @@ void PluginHostUi::RegisterBindings(pybind11::module_& host)
            "or WINDOW_MODAL. on_message(data) is called on the UI thread when the page posts; on_submit(data) "
            "is called when the page submits; offload heavy work to a thread and push results back with window.post().");
 
+    ui.def("create_side_panel", &ui_create_side_panel, py::arg("html"), py::arg("title") = "OrcaSlicer",
+           py::arg("width") = 430, py::arg("on_message") = py::none(), py::arg("on_close") = py::none(),
+           "Open the HTML page as a panel docked on the right side of the plater (a sidebar) and return a "
+           "UiWindow with the same post()/close()/is_open() contract as create_window(). The user can close "
+           "the pane with its caption close button, which fires on_close. This binding is absent from stock "
+           "builds; feature-detect it with hasattr(orca.host.ui, 'create_side_panel') and fall back to "
+           "create_window().");
+
     py::class_<UiProgressHandle>(ui, "ProgressDialog", "Handle to a native progress dialog.")
         .def(py::init(&new_progress_dialog), py::arg("title"), py::arg("message"), py::arg("maximum") = 100,
              py::arg("style") = wxPD_APP_MODAL | wxPD_AUTO_HIDE)
@@ -512,7 +608,13 @@ void PluginHostUi::close_windows_for_plugin(const std::string& plugin_key)
         for (auto* window : UiRegistry::instance().take_for_plugin(plugin_key)) {
             if (auto* dialog = dynamic_cast<GUI::PluginWebDialog*>(window))
                 GUI::PluginWebDialog::destroy_for_plugin(dialog);
-            else if (window != nullptr)
+            else if (auto* panel = dynamic_cast<GUI::PluginWebPanel*>(window)) {
+                // Docked panes must leave the plater's AUI layout before dying.
+                if (GUI::Plater* plater = GUI::wxGetApp().plater(); plater != nullptr)
+                    plater->undock_plugin_side_panel(panel->pane_name());
+                else
+                    panel->Destroy();
+            } else if (window != nullptr)
                 window->Destroy();
         }
     };

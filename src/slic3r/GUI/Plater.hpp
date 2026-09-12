@@ -3,6 +3,8 @@
 
 #include <memory>
 #include <vector>
+#include <functional>
+#include <string>
 #include <boost/filesystem/path.hpp>
 
 #include <wx/colour.h>
@@ -66,6 +68,11 @@ namespace UndoRedo {
 }
 
 namespace GUI {
+
+// Pane-name prefix for plugin panels docked via Plater::dock_plugin_side_panel.
+// The host plugin layer derives the pane's registry id from the numeric suffix.
+constexpr char PLUGIN_PANE_PREFIX[] = "plugin_panel_";
+
 class SyncAmsInfoDialog;
 class MainFrame;
 class ConfigOptionsGroup;
@@ -312,6 +319,16 @@ public:
     ~Plater();
 
     bool Show(bool show = true);
+
+    // --- Plugin side panels -------------------------------------------------
+    // Dock a plugin-supplied window as a right side pane of the plater (the
+    // plater's wxAuiManager owns that layout). pane_name must start with
+    // PLUGIN_PANE_PREFIX; the name is how the pane is addressed to close it.
+    bool dock_plugin_side_panel(wxWindow* panel, const wxString& pane_name, const wxString& caption, int width);
+    // Detach the named plugin pane from the AUI layout and destroy its window.
+    void undock_plugin_side_panel(const wxString& pane_name);
+    // Fired when the user closes a plugin pane through its AUI close button.
+    void set_plugin_pane_close_callback(std::function<void(const wxString& pane_name)> callback);
 
     bool is_project_dirty() const;
     bool is_presets_dirty() const;

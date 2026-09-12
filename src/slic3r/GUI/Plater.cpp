@@ -6724,6 +6724,10 @@ struct Plater::priv
     wxPanel* current_panel{ nullptr };
     std::vector<wxPanel*> panels;
 
+    // Plugin side panels (dock_plugin_side_panel): user-close routing.
+    std::function<void(const wxString& pane_name)> m_plugin_pane_close_cb;
+    bool                                           m_plugin_pane_close_bound{false};
+
     struct SidebarLayout
     {
         bool                  is_enabled{false};
@@ -22429,5 +22433,66 @@ wxArrayString get_all_camera_view_type() {
         all_types.Add(get_view_type_string((Camera::ViewAngleType) i));
     }
     return all_types;
+}
+
+// --- Plugin side panels ------------------------------------------------------
+
+bool Plater::dock_plugin_side_panel(wxWindow* panel, const wxString& pane_name, const wxString& caption, int width)
+{
+    if (panel == nullptr)
+        return false;
+
+    const int em   = wxGetApp().em_unit();
+    const int w    = width > 0 ? width : 26 * em;
+    const wxSize best = wxSize(w, 60 * em);
+
+    p->m_aui_mgr.AddPane(panel, wxAuiPaneInfo()
+                                      .Name(pane_name)
+                                      .Right()
+                                      .Caption(caption)
+                                      .CloseButton(true)
+                                      .TopDockable(false)
+                                      .BottomDockable(false)
+                                      .Floatable(false)
+                                      .PaneBorder(true)
+                                      .MinSize(wxSize(18 * em, 20 * em))
+                                      .BestSize(best));
+    p->m_aui_mgr.Update();
+
+    // Route AUI pane-close (the pane's own close button) to the host plugin
+    // layer once. The pane is addressed by name; AUI has already hidden it by
+    // the time the callback runs, so it only has to tear the window down.
+    if (!p->m_plugin_pane_close_bound) {
+        p->m_plugin_pane_close_bound = true;
+        p->m_aui_mgr.Bind(wxEVT_AUI_PANE_CLOSE, [this](wxAuiManagerEvent& evt) {
+            wxAuiPaneInfo* pane = evt.GetPane();
+            if (pane != nullptr && pane->name.StartsWith(PLUGIN_PANE_PREFIX)) {
+                const wxString name = pane->name;
+                wxTheApp->CallAfter([this, name]() {
+                    if (p->m_plugin_pane_close_cb)
+                        p->m_plugin_pane_close_cb(name);
+                });
+            }
+            evt.Skip();
+        });
+    }
+    return true;
+}
+
+void Plater::undock_plugin_side_panel(const wxString& pane_name)
+{
+    wxAuiPaneInfo& pane = p->m_aui_mgr.GetPane(pane_name);
+    if (!pane.IsOk())
+        return;
+    wxWindow* win = pane.window;
+    p->m_aui_mgr.DetachPane(win);
+    if (win != nullptr)
+        win->Destroy();
+    p->m_aui_mgr.Update();
+}
+
+void Plater::set_plugin_pane_close_callback(std::function<void(const wxString& pane_name)> callback)
+{
+    p->m_plugin_pane_close_cb = std::move(callback);
 }
 }}    // namespace Slic3r::GUI
