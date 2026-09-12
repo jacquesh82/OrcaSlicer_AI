@@ -70,15 +70,24 @@ CallablePtr make_holder(py::object obj)
 
 // Adapt a Python callable to a GUI message handler that acquires the GIL and
 // swallows/logs exceptions (a raising handler must not escape into wx events).
-GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message)
+//
+// The handler also re-enters the OWNING PLUGIN's audit scope. These callbacks
+// fire from wx/webview events, not from the capability trampoline, so without
+// this the plugin's code would run with an empty PluginAuditManager::
+// current_plugin() -- and every host API keyed on it (orca.host.plugin.storage,
+// orca.host.edit.*) would reject the call even for a granted plugin.
+GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message, const std::string& plugin_key)
 {
     CallablePtr holder = make_holder(std::move(on_message));
     if (!holder)
         return nullptr;
-    return [holder](const json& data) {
+    return [holder, plugin_key](const json& data) {
         PythonGILState gil;
         if (!gil)
             return;
+        std::optional<ScopedPluginAuditContext> audit_scope;
+        if (!plugin_key.empty())
+            audit_scope.emplace(plugin_key, std::string());
         try {
             holder->fn(json_to_py(data));
         } catch (py::error_already_set& e) {
@@ -88,15 +97,18 @@ GUI::PluginWebDialog::MessageHandler make_message_adapter(py::object on_message)
     };
 }
 
-GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit)
+GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit, const std::string& plugin_key)
 {
     CallablePtr holder = make_holder(std::move(on_submit));
     if (!holder)
         return nullptr;
-    return [holder](const json& data) {
+    return [holder, plugin_key](const json& data) {
         PythonGILState gil;
         if (!gil)
             return;
+        std::optional<ScopedPluginAuditContext> audit_scope;
+        if (!plugin_key.empty())
+            audit_scope.emplace(plugin_key, std::string());
         try {
             holder->fn(json_to_py(data));
         } catch (py::error_already_set& e) {
@@ -104,6 +116,26 @@ GUI::PluginWebDialog::SubmitHandler make_submit_adapter(py::object on_submit)
             PyErr_Clear();
         }
     };
+}
+
+// Same re-entry for the on_close hooks built in the window/panel creation
+// lambdas: plugin teardown code must also see its own audit identity. The key
+// is the one captured at creation time -- when a close fires from a wx event,
+// no plugin scope is open and current_plugin() would be empty.
+void call_close_holder(const CallablePtr& holder, const std::string& plugin_key)
+{
+    PythonGILState gil;
+    if (!gil || !holder)
+        return;
+    std::optional<ScopedPluginAuditContext> audit_scope;
+    if (!plugin_key.empty())
+        audit_scope.emplace(plugin_key, std::string());
+    try {
+        holder->fn();
+    } catch (py::error_already_set& e) {
+        BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_close handler raised: " << e.what();
+        PyErr_Clear();
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -250,10 +282,10 @@ struct UiProgressHandle
 py::object ui_create_window(const std::string& html, const std::string& title, int width, int height,
                             py::object on_message, py::object on_close, long style, py::object on_submit)
 {
-    auto              msg_adapter    = make_message_adapter(std::move(on_message));
-    auto              submit_adapter = make_submit_adapter(std::move(on_submit));
-    CallablePtr       close_holder   = make_holder(std::move(on_close));
     const std::string plugin_key     = PluginAuditManager::instance().current_plugin();
+    auto              msg_adapter    = make_message_adapter(std::move(on_message), plugin_key);
+    auto              submit_adapter = make_submit_adapter(std::move(on_submit), plugin_key);
+    CallablePtr       close_holder   = make_holder(std::move(on_close));
     const int         w              = width > 0 ? width : 820;
     const int         h              = height > 0 ? height : 600;
 
@@ -296,17 +328,7 @@ py::object ui_create_window(const std::string& html, const std::string& title, i
         // teardown), while the dialog is alive. Empty if the plugin passed None.
         GUI::PluginWebDialog::CloseHandler on_close;
         if (close_holder) {
-            on_close = [close_holder]() {
-                PythonGILState gil;
-                if (!gil)
-                    return;
-                try {
-                    close_holder->fn();
-                } catch (py::error_already_set& e) {
-                    BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_close handler raised: " << e.what();
-                    PyErr_Clear();
-                }
-            };
+            on_close = [close_holder, plugin_key]() { call_close_holder(close_holder, plugin_key); };
         }
         // Registry cleanup: GIL-free, runs from the dialog destructor on every path.
         auto on_destroyed = [new_id]() { UiRegistry::instance().remove(new_id); };
@@ -353,9 +375,9 @@ void on_plugin_pane_closed(const wxString& pane_name)
 py::object ui_create_side_panel(const std::string& html, const std::string& title, int width,
                                 py::object on_message, py::object on_close)
 {
-    auto          msg_adapter  = make_message_adapter(std::move(on_message));
+    const std::string plugin_key   = PluginAuditManager::instance().current_plugin();
+    auto          msg_adapter  = make_message_adapter(std::move(on_message), plugin_key);
     CallablePtr   close_holder = make_holder(std::move(on_close));
-    const std::string plugin_key = PluginAuditManager::instance().current_plugin();
 
     if (wxTheApp == nullptr)
         throw std::runtime_error("OrcaSlicer application is not initialized");
@@ -377,17 +399,7 @@ py::object ui_create_side_panel(const std::string& html, const std::string& titl
 
         GUI::PluginWebPanel::CloseHandler on_close;
         if (close_holder) {
-            on_close = [close_holder]() {
-                PythonGILState gil;
-                if (!gil)
-                    return;
-                try {
-                    close_holder->fn();
-                } catch (py::error_already_set& e) {
-                    BOOST_LOG_TRIVIAL(error) << "orca.host.ui on_close handler raised: " << e.what();
-                    PyErr_Clear();
-                }
-            };
+            on_close = [close_holder, plugin_key]() { call_close_holder(close_holder, plugin_key); };
         }
         // Registry cleanup: GIL-free, runs from the panel destructor on every path.
         auto on_destroyed = [new_id]() { UiRegistry::instance().remove(new_id); };
