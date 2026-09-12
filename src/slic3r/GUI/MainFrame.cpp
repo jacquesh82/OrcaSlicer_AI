@@ -1227,6 +1227,8 @@ void MainFrame::show_option(bool show)
             m_print_btn->Hide();
             m_slice_option_btn->Hide();
             m_print_option_btn->Hide();
+            m_ai_btn->Hide();
+            m_ai_option_btn->Hide();
             Layout();
         }
     } else {
@@ -1235,6 +1237,8 @@ void MainFrame::show_option(bool show)
             m_print_btn->Show();
             m_slice_option_btn->Show();
             m_print_option_btn->Show();
+            m_ai_btn->Show();
+            m_ai_option_btn->Show();
             Layout();
         }
     }
