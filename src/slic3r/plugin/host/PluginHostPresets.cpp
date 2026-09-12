@@ -1,8 +1,13 @@
 #include "PluginHostBindings.hpp"
 #include "slic3r/plugin/PluginBindingUtils.hpp"
 
+#include <libslic3r/PlaceholderParser.hpp>
 #include <libslic3r/Preset.hpp>
 #include <libslic3r/PresetBundle.hpp>
+
+#include <slic3r/GUI/GUI_App.hpp>
+
+#include <stdexcept>
 
 #include <pybind11/stl.h>
 
@@ -30,6 +35,52 @@ py::list current_filament_presets(PresetBundle& bundle)
 PresetCollection& printer_presets(PresetBundle& bundle)
 {
     return static_cast<PresetCollection&>(bundle.printers);
+}
+
+// --------------------------------------------------------------------------
+// orca.host.render_gcode_template
+//
+// Custom G-code in a profile is a template, not literal G-code: machine_start_gcode,
+// change_filament_gcode and friends carry placeholders ({next_extruder}, [layer_z],
+// conditionals, arithmetic) that only mean something once resolved against the active
+// config. A plugin that emitted one verbatim would write invalid G-code, so rendering
+// is done here with the same PlaceholderParser the slicer itself uses.
+//
+// Variables the slicer would normally supply per call site (next_extruder, layer_z, ...)
+// have no meaning outside a running slice, so the caller passes the ones it knows. A
+// template referencing anything still undefined fails loudly with the parser's own
+// message rather than silently producing broken output.
+// --------------------------------------------------------------------------
+std::string render_gcode_template(const std::string& templ, const py::dict& variables, unsigned int current_extruder_id)
+{
+    PresetBundle* bundle = GUI::wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        throw std::runtime_error("presets are not loaded yet");
+
+    PlaceholderParser parser;
+    parser.apply_config(bundle->full_config());
+    parser.update_timestamp();
+
+    // Typed on purpose: a template may compare {next_extruder} numerically, and a
+    // string-typed value would make that comparison fail rather than evaluate.
+    for (auto item : variables) {
+        const std::string key = py::str(item.first).cast<std::string>();
+        py::handle        value = item.second;
+        if (py::isinstance<py::bool_>(value))
+            parser.set(key, value.cast<bool>());
+        else if (py::isinstance<py::int_>(value))
+            parser.set(key, value.cast<int>());
+        else if (py::isinstance<py::float_>(value))
+            parser.set(key, value.cast<double>());
+        else
+            parser.set(key, py::str(value).cast<std::string>());
+    }
+
+    try {
+        return parser.process(templ, current_extruder_id);
+    } catch (const std::exception& exc) {
+        throw std::runtime_error(std::string("G-code template failed to render: ") + exc.what());
+    }
 }
 
 } // namespace
@@ -133,6 +184,14 @@ void host_bindings::register_presets(py::module_& host)
         .def("full_config_value", [](const PresetBundle& bundle, const std::string& key) {
             return config_value_or_none(bundle.full_config(), key);
         });
-}
 
+    host.def("render_gcode_template", &render_gcode_template, py::arg("template"),
+             py::arg("variables") = py::dict(), py::arg("current_extruder_id") = 0,
+             "Resolve a profile's custom G-code template (machine_start_gcode, "
+             "change_filament_gcode, ...) against the active config, using the slicer's own "
+             "PlaceholderParser. `variables` supplies the per-call-site values the slicer "
+             "would normally inject (next_extruder, layer_z, ...); ints, floats, bools and "
+             "strings keep their type. Raises RuntimeError naming the offending placeholder "
+             "if the template references something still undefined.");
+}
 } // namespace Slic3r
