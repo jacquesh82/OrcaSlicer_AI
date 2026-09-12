@@ -37,6 +37,9 @@ void PluginHost::RegisterBindings(pybind11::module_& module)
     host_bindings::register_presets(host);
     host_bindings::register_model(host);
     host_bindings::register_app(host);
+    // Settings writes and their metadata. Registered after presets so the read-only
+    // surface an edit is based on is already bound.
+    host_bindings::register_edit(host);
     host_bindings::register_plugin(host);
 
     // UI: native dialogs and interactive HTML windows for plugins.

@@ -632,6 +632,7 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHost.hpp
     plugin/host/PluginHostBindings.hpp
     plugin/host/PluginHostApp.cpp
+    plugin/host/PluginHostEdit.cpp
     plugin/host/PluginHostGeometry.cpp
     plugin/host/PluginHostMesh.cpp
     plugin/host/PluginHostMesh.hpp
@@ -640,6 +641,7 @@ set(SLIC3R_GUI_SOURCES
     plugin/host/PluginHostSlicing.cpp
     plugin/host/PluginHostUi.cpp
     plugin/host/PluginHostUi.hpp
+    plugin/host/PluginHostUiThread.hpp
     plugin/host/PluginPages.cpp
     plugin/host/PluginPages.hpp
     plugin/CloudPluginService.cpp
