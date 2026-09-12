@@ -432,6 +432,8 @@ public:
     void update_side_button_style();
     // Runs an Orca Copilot capability by name ("Orca Copilot" / "Orca Copilot Auto").
     void run_ai_copilot(const wxString& capability_name);
+    // Installs the bundled Orca Copilot plugin from resources when missing.
+    bool ensure_copilot_installed();
     void update_slice_print_status(SlicePrintEventType event, bool can_slice = true, bool can_print = true);
 
 #ifdef __APPLE__

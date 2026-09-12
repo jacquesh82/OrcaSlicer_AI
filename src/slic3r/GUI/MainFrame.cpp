@@ -57,6 +57,8 @@
 #include "GUI_ObjectList.hpp"
 #include "NotificationManager.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
+#include <libslic3r/Utils.hpp>
+#include <boost/filesystem.hpp>
 #include "MarkdownTip.hpp"
 #include "NetworkTestDialog.hpp"
 #include "ConfigWizard.hpp"
@@ -2491,13 +2493,56 @@ bool MainFrame::get_enable_print_status()
     return enable;
 }
 
+// Installs the bundled Orca Copilot plugin when the data dir has none, and
+// always refreshes the MCP bridge copy in the plugin's storage dir. The entry
+// .py is only installed when ABSENT: reinstalling would reset the user's
+// settings-write consent (new version = new code = consent to re-grant).
+bool MainFrame::ensure_copilot_installed()
+{
+    namespace fs = boost::filesystem;
+
+    const fs::path bundled_dir   = fs::path(resources_dir()) / "bundled_plugins" / "orca_copilot";
+    const fs::path bundled_py    = bundled_dir / "orca_copilot.py";
+    const fs::path bundled_bridge = bundled_dir / "orca_mcp_bridge.py";
+    if (!fs::exists(bundled_py))
+        return false;
+
+    const fs::path plugins_dir = fs::path(data_dir()) / "orca_plugins";
+    if (!fs::exists(plugins_dir / "orca_copilot" / "orca_copilot.py")) {
+        std::string error;
+        if (!Slic3r::PluginManager::instance().install_plugin(bundled_py.string(), error)) {
+            BOOST_LOG_TRIVIAL(error) << "Copilot bootstrap: plugin install failed: " << error;
+            return false;
+        }
+        Slic3r::PluginManager::instance().load_plugin("orca_copilot");
+    }
+
+    // The installer handles the single entry file only; the bridge travels in
+    // the plugin's storage dir (orca.host.plugin.storage() for local plugins).
+    if (fs::exists(bundled_bridge)) {
+        const fs::path storage = plugins_dir / "plugin_data" / "orca_copilot";
+        boost::system::error_code ec;
+        fs::create_directories(storage, ec);
+        fs::copy_file(bundled_bridge, storage / "orca_mcp_bridge.py", fs::copy_option::overwrite_if_exists, ec);
+    }
+    return true;
+}
+
 void MainFrame::run_ai_copilot(const wxString& capability_name)
 {
     // Runs on the UI thread; the capability's execute() is the fast part
     // (open the side panel, spawn the agent session on its own thread).
     std::string error;
-    const auto  result = Slic3r::PluginManager::instance().run_script_capability(
+    auto  result = Slic3r::PluginManager::instance().run_script_capability(
         "orca_copilot", capability_name.utf8_string(), error);
+    if (result.status != Slic3r::PluginResult::Success && !Slic3r::PluginManager::instance().is_plugin_loaded("orca_copilot")) {
+        // Plugin absent: install the bundled copy (which also loads it) and retry.
+        if (ensure_copilot_installed()) {
+            error.clear();
+            result = Slic3r::PluginManager::instance().run_script_capability(
+                "orca_copilot", capability_name.utf8_string(), error);
+        }
+    }
     if (result.status != Slic3r::PluginResult::Success) {
         wxMessageDialog dlg(
             this,
