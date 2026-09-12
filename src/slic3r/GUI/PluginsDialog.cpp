@@ -6,6 +6,7 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "slic3r/plugin/PluginConfig.hpp"
 #include "slic3r/plugin/PluginFsUtils.hpp"
+#include "slic3r/plugin/PluginAuditManager.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
 
 #include <libslic3r/Utils.hpp>
@@ -199,6 +200,9 @@ nlohmann::json build_plugin_payload_item(const PluginDialogItem& dialog_item)
     payload_item["type"]        = dialog_item.type_label;
     payload_item["type_key"]    = dialog_item.type_key;
     payload_item["types"]       = dialog_item.type_labels;
+    // Settings-write consent, read straight from the .install_state.json sidecar so the
+    // switch always shows what is actually persisted rather than a UI-side cache.
+    payload_item["settings_write"] = PluginAuditManager::instance().settings_write_granted(dialog_item.plugin_key);
 
     nlohmann::json caps = nlohmann::json::array();
     for (const PluginCapabilityView& capability : dialog_item.capabilities) {
@@ -513,6 +517,8 @@ void PluginsDialog::handle_web_command(const nlohmann::json& payload)
         refresh_plugins();
     } else if (command == "toggle_plugin") {
         toggle_plugin(payload.value("plugin_key", ""), payload.value("enabled", false));
+    } else if (command == "toggle_plugin_settings_write") {
+        toggle_plugin_settings_write(payload.value("plugin_key", ""), payload.value("enabled", false));
     } else if (command == "toggle_plugin_capability") {
         toggle_plugin_capability(payload.value("plugin_key", ""), plugin_capability_type_from_string(payload.value("capability_type", "")),
                                  payload.value("capability_name", ""), payload.value("enabled", false));
@@ -635,6 +641,56 @@ void PluginsDialog::refresh_plugins()
     BOOST_LOG_TRIVIAL(info) << "Refreshing plugins from Plugins dialog";
 
     refresh_plugin_metadata_async(_L("Refreshing"), _L("Refreshing plugins data"), kFetchCloudMeta);
+}
+
+void PluginsDialog::toggle_plugin_settings_write(const std::string& plugin_key, bool enabled)
+{
+    if (plugin_key.empty())
+        return;
+
+    PluginDescriptor descriptor;
+    if (!get_descriptor(plugin_key, descriptor)) {
+        send_plugins();
+        return;
+    }
+
+    const wxString display_name = plugin_display_name(plugin_key);
+
+    if (enabled) {
+        // Granting write access is the one plugin action that lets third-party code
+        // rewrite the user's print settings, so it is never silent: name the plugin,
+        // say plainly what it gets, and default the dialog to No.
+        wxMessageDialog confirm(
+            this,
+            wxString::Format(
+                _L("Allow \"%s\" to modify your settings?\n\n"
+                   "This plugin will be able to change print, filament and printer settings "
+                   "on its own. Changes stay visible in the settings tabs and can be undone "
+                   "with Ctrl+Z, but they are applied without asking again.\n\n"
+                   "Only allow this for a plugin you trust."),
+                display_name),
+            _L("Allow modifying settings"),
+            wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+        const int rc = confirm.ShowModal();
+        restore_z_order();
+        if (rc != wxID_YES) {
+            send_plugins(); // re-render so the checkbox snaps back to off
+            return;
+        }
+    }
+
+    if (!PluginAuditManager::instance().set_settings_write(plugin_key, enabled)) {
+        BOOST_LOG_TRIVIAL(error) << "Failed to persist settings_write for plugin " << plugin_key;
+        show_status(_L("Failed to save the settings permission."), "warn");
+        send_plugins();
+        return;
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "settings_write=" << enabled << " for plugin " << plugin_key;
+    send_plugins();
+    show_status(enabled ? wxString::Format(_L("\"%s\" can now modify settings."), display_name)
+                        : wxString::Format(_L("\"%s\" can no longer modify settings."), display_name),
+                enabled ? "warn" : "success");
 }
 
 void PluginsDialog::toggle_plugin(const std::string& plugin_key, bool enabled)

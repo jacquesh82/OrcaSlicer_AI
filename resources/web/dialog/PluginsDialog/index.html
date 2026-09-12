@@ -137,6 +137,21 @@
                       title="Update to the latest version">Update</button>
                   </div>
                 </div>
+                <div class="detail-field-row" id="detailSettingsWriteRow">
+                  <div class="detail-label">Settings access</div>
+                  <div class="detail-value">
+                    <label class="plugin-checkbox" id="detailSettingsWriteLabel">
+                      <input type="checkbox" class="plugin-checkbox-input" id="detailSettingsWrite" />
+                      <span class="plugin-checkbox-mark"></span>
+                    </label>
+                    <span class="detail-settings-write-text">Allow modifying settings</span>
+                    <div class="detail-settings-write-hint">
+                      Lets this plugin change print, filament and printer settings through
+                      <code>orca.host.edit</code>. Off by default, and revoked automatically
+                      when the plugin is updated.
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </section>

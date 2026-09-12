@@ -73,6 +73,9 @@ private:
     void refresh_plugins();
     void toggle_plugin(const std::string& plugin_key, bool enabled);
     void toggle_plugin_capability(const std::string& plugin_key, PluginCapabilityType type, const std::string& capability_name, bool enabled);
+    // Grants or revokes the plugin's permission to write slicer settings through
+    // orca.host.edit. Granting always asks the user first.
+    void toggle_plugin_settings_write(const std::string& plugin_key, bool enabled);
     void handle_plugin_menu_action(const std::string& plugin_key, const std::string& action);
 
     void install_plugin_from_file();

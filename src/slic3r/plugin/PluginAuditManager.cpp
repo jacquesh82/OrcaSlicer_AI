@@ -441,6 +441,49 @@ AuditDecision PluginAuditManager::check_open(const std::string& path_str, const 
     return check_path_access(boost::filesystem::path(path_str), is_write);
 }
 
+bool PluginAuditManager::settings_write_granted(const std::string& plugin_key) const
+{
+    if (plugin_key.empty())
+        return false;
+
+    PluginDescriptor descriptor;
+    if (!PluginManager::instance().try_get_plugin_descriptor(plugin_key, descriptor) || descriptor.plugin_root.empty())
+        return false;
+
+    PluginInstallState state;
+    if (!read_install_state(boost::filesystem::path(descriptor.plugin_root), state))
+        return false;
+    return state.permissions.settings_write;
+}
+
+bool PluginAuditManager::set_settings_write(const std::string& plugin_key, bool granted)
+{
+    if (plugin_key.empty())
+        return false;
+
+    PluginDescriptor descriptor;
+    if (!PluginManager::instance().try_get_plugin_descriptor(plugin_key, descriptor) || descriptor.plugin_root.empty())
+        return false;
+
+    const boost::filesystem::path plugin_root(descriptor.plugin_root);
+    PluginInstallState state;
+    read_install_state(plugin_root, state);
+
+    // Mirrors request_filesystem_read_permissions: a sidecar that was never written
+    // needs its identity fields seeded before the grant can be persisted.
+    if (state.plugin_name.empty()) {
+        state.installed_from    = descriptor.is_cloud_plugin() ? "cloud" : "local";
+        state.installed_version = !descriptor.installed_version.empty() ? descriptor.installed_version : descriptor.version;
+        state.plugin_name       = descriptor.name;
+        state.cloud_uuid        = descriptor.cloud_uuid();
+        state.enabled           = true;
+    }
+
+    state.permissions.settings_write = granted;
+    BOOST_LOG_TRIVIAL(info) << "[AUDIT] settings_write=" << granted << " plugin=" << plugin_key;
+    return write_install_state(plugin_root, state);
+}
+
 bool PluginAuditManager::request_filesystem_read_permissions(const std::string&              plugin_key,
                                                               const std::vector<std::string>& paths)
 {

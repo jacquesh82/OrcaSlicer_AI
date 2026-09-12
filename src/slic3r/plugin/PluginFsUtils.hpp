@@ -89,6 +89,11 @@ struct PluginPermissions
     std::vector<std::string> network_http;
     std::vector<std::string> network_socket;
     std::vector<std::string> process;
+    // Whether the plugin may write slicer settings through orca.host.edit.
+    // Unlike the lists above this is not a per-target grant collected by the audit
+    // hook: it is a single switch the user flips in the Plugins dialog, and it is
+    // cleared whenever the plugin's installed version changes (new code, new consent).
+    bool                     settings_write = false;
 };
 
 struct PluginInstallState {

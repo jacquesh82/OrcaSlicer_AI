@@ -799,6 +799,8 @@ bool read_install_state(const boost::filesystem::path& plugin_dir, PluginInstall
             read_string_list("network_http", parsed.permissions.network_http);
             read_string_list("network_socket", parsed.permissions.network_socket);
             read_string_list("process", parsed.permissions.process);
+            if (permissions.contains("settings_write") && permissions["settings_write"].is_boolean())
+                parsed.permissions.settings_write = permissions["settings_write"].get<bool>();
         }
 
         if (state.contains("enabled") && state["enabled"].is_boolean())
@@ -842,6 +844,7 @@ bool write_install_state(const boost::filesystem::path& plugin_dir, const Plugin
         {"network_http", state.permissions.network_http},
         {"network_socket", state.permissions.network_socket},
         {"process", state.permissions.process},
+        {"settings_write", state.permissions.settings_write},
     };
 
     nlohmann::json capabilities = nlohmann::json::array();
@@ -864,6 +867,7 @@ bool write_install_state(const boost::filesystem::path& plugin_dir, const Plugin
     // Loading a plugin updates its lifecycle/capability state, but must retain permissions granted
     // during register_capabilities() or by a previous runtime audit prompt.
     read_install_state(plugin_dir, state);
+    const std::string previous_version = state.installed_version;
     state.installed_from    = entry.is_cloud_plugin() ? "cloud" : "local";
     // Prefer the descriptor's recorded installed_version (the version fetched from the cloud
     // at install time, preserved across sidecar re-writes) so a stale manifest/PEP723 header
@@ -874,6 +878,10 @@ bool write_install_state(const boost::filesystem::path& plugin_dir, const Plugin
     state.cloud_uuid        = entry.cloud_uuid();
     state.enabled           = enabled;
     state.capabilities      = capabilities;
+    // Settings-write consent is tied to the exact code the user agreed to trust. A new
+    // version is new code, so the switch goes back off and has to be granted again.
+    if (!previous_version.empty() && previous_version != state.installed_version)
+        state.permissions.settings_write = false;
     return write_install_state(plugin_dir, state);
 }
 

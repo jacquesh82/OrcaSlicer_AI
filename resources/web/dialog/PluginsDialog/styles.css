@@ -1388,3 +1388,21 @@ body.pane-resizing {
   }
 
 }
+
+
+/* Settings-write consent switch (Plugin Info panel). */
+.detail-settings-write-text {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.detail-settings-write-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.45;
+  opacity: 0.7;
+}
+
+#detailSettingsWriteRow .plugin-checkbox {
+  vertical-align: middle;
+}

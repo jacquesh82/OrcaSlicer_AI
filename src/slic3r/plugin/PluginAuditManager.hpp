@@ -139,6 +139,14 @@ public:
     bool request_filesystem_read_permissions(const std::string& plugin_key,
                                              const std::vector<std::string>& paths);
 
+    // --- Settings-write consent (orca.host.edit) -------------------------------
+    // Not an audit-hook grant: a single switch the user flips in the Plugins dialog.
+    // The audit hook never sees orca.host.edit calls -- those cross the C++ binding
+    // directly instead of raising a CPython audit event -- so the binding itself asks
+    // here before touching a preset.
+    bool settings_write_granted(const std::string& plugin_key) const;
+    bool set_settings_write(const std::string& plugin_key, bool granted);
+
     void report_violation(const AuditViolation& violation);
     bool audit_denial_pending() const;
     void clear_audit_denial();

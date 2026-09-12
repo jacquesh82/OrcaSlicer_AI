@@ -60,6 +60,7 @@ function OnInit() {
   exploreMenu?.addEventListener("click", OnExploreMenuClick);
   document.getElementById("open_terminal")?.addEventListener("click", () => SendMessage("open_terminal"));
   document.getElementById("detailUpdateBtn")?.addEventListener("click", UpdateSelectedPlugin);
+  document.getElementById("detailSettingsWrite")?.addEventListener("change", OnSettingsWriteToggle);
 
   document.querySelectorAll("[role='tab']").forEach((tab) => {
     tab.addEventListener("click", () => ActivateDetailTab(String(tab.dataset.tab || "")));
@@ -868,6 +869,44 @@ function StatusCell(plugin) {
   return cell;
 }
 
+// Settings-write consent. Unlike the capability checkboxes this is a permission,
+// not a lifecycle flag: the C++ side asks for confirmation before granting it, and
+// clears it whenever the plugin's installed version changes.
+function RenderSettingsWrite(plugin) {
+  const row = document.getElementById("detailSettingsWriteRow");
+  const checkbox = document.getElementById("detailSettingsWrite");
+  if (!row || !checkbox)
+    return;
+
+  // Only an installed local/cloud package has a sidecar to hold the grant.
+  const applicable = !!plugin && IsPluginInstalled(plugin);
+  row.hidden = !applicable;
+  if (!applicable) {
+    checkbox.checked = false;
+    return;
+  }
+
+  checkbox.checked = !!plugin.settings_write;
+  checkbox.disabled = false;
+  checkbox.dataset.pluginKey = String(plugin.plugin_key || "");
+}
+
+function OnSettingsWriteToggle(event) {
+  const checkbox = event.currentTarget;
+  const pluginKey = String(checkbox.dataset.pluginKey || "");
+  if (!pluginKey)
+    return;
+
+  // The C++ handler confirms with the user and answers with a refreshed plugin
+  // list, so the box is left disabled until that list lands: it must never show
+  // a grant the user has not actually given.
+  checkbox.disabled = true;
+  SendMessage("toggle_plugin_settings_write", {
+    plugin_key: pluginKey,
+    enabled: !!checkbox.checked
+  });
+}
+
 function RenderDetails() {
   const plugin = selectedPluginId ? pluginsById.get(selectedPluginId) : null;
   const detailUpdateBadge = document.getElementById("detailUpdateBadge");
@@ -887,6 +926,7 @@ function RenderDetails() {
   }
   SetText("detailTypes", plugin ? GetPluginTypes(plugin) : "-");
   SetText("detailAuthor", plugin ? (plugin.author || "-") : "-");
+  RenderSettingsWrite(plugin);
   RenderThumbnail(plugin);
   RenderDescription(plugin);
   RenderChangelog(plugin);
