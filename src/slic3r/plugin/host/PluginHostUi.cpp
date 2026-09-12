@@ -18,7 +18,10 @@
 
 #include <boost/log/trivial.hpp>
 
+#include <boost/nowide/fstream.hpp>
+
 #include <wx/app.h>
+#include <wx/filedlg.h>
 #include <wx/defs.h>
 #include <wx/window.h>
 
@@ -216,6 +219,44 @@ using Slic3r::host_bindings::run_on_ui_blocking;
 wxWindow* ui_parent()
 {
     return wxTheApp == nullptr ? nullptr : dynamic_cast<wxWindow*>(GUI::wxGetApp().mainframe);
+}
+
+// --------------------------------------------------------------------------
+// orca.host.ui.save_file
+//
+// A plugin cannot write a file itself: the audit hook denies any path outside an
+// allowed root, and on Linux data_dir() is ~/.config/OrcaSlicer, whose ".config"
+// component trips the denied-keyword rule -- so even the plugin's own storage is
+// unreachable. Exporting therefore goes through the host: the user picks the
+// destination in a native save dialog and OrcaSlicer does the write. The consent
+// is the dialog itself, which is why this needs no audit grant.
+// --------------------------------------------------------------------------
+py::object ui_save_file(const std::string& content, const std::string& suggested_name,
+                        const std::string& title, const std::string& wildcard)
+{
+    std::string chosen = run_on_ui_blocking([&]() -> std::string {
+        wxFileDialog dialog(ui_parent(),
+                            title.empty() ? wxString("Save file") : wxString::FromUTF8(title),
+                            wxEmptyString,
+                            wxString::FromUTF8(suggested_name),
+                            wildcard.empty() ? wxString("All files (*.*)|*.*") : wxString::FromUTF8(wildcard),
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK)
+            return {};
+
+        const wxString path = dialog.GetPath();
+        boost::nowide::ofstream out(path.ToUTF8().data(), std::ios::binary);
+        if (!out)
+            throw std::runtime_error("could not open the destination for writing: " + std::string(path.ToUTF8().data()));
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!out)
+            throw std::runtime_error("could not write the file: " + std::string(path.ToUTF8().data()));
+        return std::string(path.ToUTF8().data());
+    });
+
+    if (chosen.empty())
+        return py::none(); // the user cancelled; not an error
+    return py::cast(chosen);
 }
 
 // --------------------------------------------------------------------------
@@ -528,6 +569,13 @@ void PluginHostUi::RegisterBindings(pybind11::module_& host)
         "Do not call these from a slicing pipeline hook (SlicingPipeline capability): that hook runs "
         "on the slicing worker thread, which the UI thread can itself be blocked waiting on, so a "
         "marshaled UI call from there can deadlock the application.");
+
+    ui.def("save_file", &ui_save_file, py::arg("content"), py::arg("suggested_name") = "",
+           py::arg("title") = "", py::arg("wildcard") = "",
+           "Ask the user where to save `content` and write it there, returning the chosen path "
+           "or None if they cancelled. A plugin cannot open a file for writing itself -- the audit "
+           "hook allows no writable root it can reach -- so this is how a plugin exports data. "
+           "The save dialog IS the user's consent, so no permission grant is involved.");
 
     ui.def("message", &ui_message, py::arg("text"), py::arg("title") = "OrcaSlicer", py::arg("buttons") = "ok",
            py::arg("icon") = "info",
