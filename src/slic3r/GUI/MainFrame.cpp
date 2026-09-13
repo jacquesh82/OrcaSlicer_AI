@@ -2512,7 +2512,9 @@ bool MainFrame::ensure_copilot_installed()
         return false;
 
     const fs::path plugins_dir = fs::path(data_dir()) / "orca_plugins";
-    if (!fs::exists(plugins_dir / "orca_copilot" / "orca_copilot.py")) {
+    // Local-install convention: the directory is the ENTRY FILE name with its
+    // extension (orca_plugins/orca_copilot.py/), the plugin key is the stem.
+    if (!fs::exists(plugins_dir / "orca_copilot.py" / "orca_copilot.py")) {
         std::string error;
         if (!Slic3r::PluginManager::instance().install_plugin(bundled_py.string(), error)) {
             BOOST_LOG_TRIVIAL(error) << "Copilot bootstrap: plugin install failed: " << error;

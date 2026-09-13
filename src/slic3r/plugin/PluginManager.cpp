@@ -255,6 +255,73 @@ void PluginManager::run_discovery(bool async, bool clear)
         task();
 }
 
+// Default plugins: everything shipped under resources/bundled_plugins/ is
+// installed into the user's plugin directory at discovery time, so it is
+// present and ENABLED on first launch -- and comes back if the user deletes
+// it, like a built-in. Companion files that are not the entry .py/.whl (the
+// Copilot's MCP bridge) land in the plugin's storage dir
+// ({data}/orca_plugins/plugin_data/<key>/), which is what
+// orca.host.plugin.storage() resolves to for a local plugin.
+//
+// An ALREADY installed plugin is never reinstalled: the user's enable flag and
+// the settings-write consent live in its .install_state.json and a reinstall
+// would reset them.
+void sync_bundled_plugins(const std::string& cloud_user_id)
+{
+    namespace fs = boost::filesystem;
+    boost::system::error_code ec;
+
+    const fs::path bundled_root = fs::path(resources_dir()) / "bundled_plugins";
+    if (!fs::is_directory(bundled_root, ec))
+        return;
+    const fs::path plugins_root = fs::path(data_dir()) / "orca_plugins";
+
+    for (fs::directory_iterator it(bundled_root, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        if (!it->is_directory(ec))
+            continue;
+        const std::string key = it->path().filename().string();
+        if (key.empty() || key[0] == '.' || key.rfind("__", 0) == 0 || key == PLUGIN_SUBSCRIBED_DIR || key == PLUGIN_DATA_DIR)
+            continue;
+
+        const fs::path entry_py = it->path() / (key + ".py");
+        if (!fs::is_regular_file(entry_py, ec))
+            continue;
+
+        // The local installer's directory convention is the FILE name with its
+        // extension ({data}/orca_plugins/orca_copilot.py/), while plugin_key is
+        // the stem. Presence must be checked where the installer actually puts
+        // it, or every startup would reinstall -- and a reinstall resets the
+        // user's enable flag and settings-write consent.
+        const fs::path install_dir = plugins_root / entry_py.filename();
+        if (!fs::is_regular_file(install_dir / entry_py.filename(), ec)) {
+            std::string error;
+            if (!plugin_loader::install_plugin(entry_py, cloud_user_id, error)) {
+                BOOST_LOG_TRIVIAL(warning) << "Bundled plugin '" << key << "' failed to install: " << error;
+                continue;
+            }
+            BOOST_LOG_TRIVIAL(info) << "Bundled plugin '" << key << "' installed as a default plugin";
+        }
+
+        // Companion files ride along on every startup (bridge updates ship
+        // with the app), overwriting only the storage copies. Only the ENTRY
+        // file is skipped: a companion can be a .py too (the MCP bridge).
+        const fs::path storage = plugins_root / PLUGIN_DATA_DIR / key;
+        boost::system::error_code fec;
+        for (fs::directory_iterator fit(it->path(), fec); !fec && fit != fs::directory_iterator(); fit.increment(fec)) {
+            if (!fit->is_regular_file(fec))
+                continue;
+            const std::string name = fit->path().filename().string();
+            if (name == key + ".py" || name == key + ".whl")
+                continue;
+            boost::system::error_code cie;
+            fs::create_directories(storage, cie);
+            fs::copy_file(fit->path(), storage / fit->path().filename(), fs::copy_option::overwrite_if_exists, cie);
+            if (cie)
+                BOOST_LOG_TRIVIAL(warning) << "Bundled plugin '" << key << "': companion file copy failed: " << cie.message();
+        }
+    }
+}
+
 void PluginManager::run_discovery_task(bool clear)
 {
     std::string error;
@@ -265,6 +332,10 @@ void PluginManager::run_discovery_task(bool clear)
             std::lock_guard<std::mutex> lock(m_mutex);
             cloud_user_id = m_cloud_user_id;
         }
+
+        // Ship the bundled defaults before scanning, so this very discovery
+        // pass sees (and loads) them.
+        sync_bundled_plugins(cloud_user_id);
 
         const std::vector<std::string> dirs      = get_plugin_directories(cloud_user_id);
         std::vector<PluginDescriptor> discovered = discover_plugin_packages(dirs, error);
