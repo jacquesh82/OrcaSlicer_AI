@@ -337,8 +337,9 @@ Tu disposes d'outils MCP (prefixe mcp__orca__) branches sur la session OrcaSlice
 - get_presets : presets actifs (process / filament / imprimante) et leur etat.
 - get_model_info : geometrie de la piece chargee sur le plateau (indices, rotation).
 - apply_settings : applique des reglages. L'utilisateur voit un diff et confirme.
-- rotate_objects : fait pivoter des objets du plateau (degres relatifs par axe,
-  indices d'objets optionnels). L'utilisateur voit une carte et confirme.
+- rotate_objects : fait pivoter des objets du plateau (degres relatifs par axe).
+  objects=null pivote TOUT le plateau ; sinon liste d'indices (get_model_info).
+  L'utilisateur voit une carte et confirme.
 - get_slicing_status : verdict VIF du slicer — etat, erreur bloquante, warnings
   (level 0=info, 1=warning, 2=error).
 
@@ -1554,9 +1555,16 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
             raise ValueError("rotation doit avoir au moins un axe non nul, ex {\"z\": 90}")
 
         objects = params.get("objects")
-        if objects is not None and (not isinstance(objects, list) or
-                                    not all(isinstance(i, int) for i in objects)):
-            raise ValueError("objects attend une liste d'indices (get_model_info), ou null pour tout le plateau")
+        if objects is not None:
+            # Les modeles emettent parfois des flottants ([0.0, 1.0]) : on
+            # accepte tout numerique et on normalise en int, sinon l'outil
+            # echoue et l'agent se rabat sur un seul objet.
+            if not isinstance(objects, list):
+                raise ValueError("objects attend une liste d'indices (get_model_info), ou null pour tout le plateau")
+            try:
+                objects = [int(i) for i in objects]
+            except (TypeError, ValueError):
+                raise ValueError("objects attend une liste d'indices numeriques, ou null pour tout le plateau")
 
         drop_to_bed = bool(params.get("drop_to_bed", True))
         if not self._snapshot.get("model", {}).get("objects"):
@@ -1608,6 +1616,12 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
                 objects=entry["objects"],
                 drop_to_bed=entry["drop_to_bed"])
             entry["result"] = {"applied": True, "report": report}
+            # Resultat visible immediatement : si l'agent n'en a vise qu'un,
+            # l'ecart saute aux yeux au lieu de passer inapercu.
+            rotated = (report or {}).get("rotated") or []
+            self.post({"command": "info",
+                       "text": "Rotation appliquee : objet(s) %s (%d)."
+                               % (", ".join(str(i) for i in rotated) or "aucun", len(rotated))})
         except Exception as exc:
             entry["result"] = {"applied": False, "error": "%s: %s" % (type(exc).__name__, exc)}
             self.post({"command": "error", "text": "Rotation refusee: %s" % exc})
