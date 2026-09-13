@@ -53,12 +53,36 @@ _LIVE_COPILOTS = []
 # Demande initiale du mode Automatique (bouton « AI optimisation » de la barre).
 AUTO_PROMPT = (
     "Analyse la piece sur le plateau et ma configuration pour une meilleure impression. "
-    "Utilise get_model_info pour la geometrie et get_settings pour la configuration, "
-    "consulte get_setting_metadata avant toute proposition. Cherche les reglages "
-    "sous-optimaux (suretes, supports, temps, temperature, vitesses...) et propose "
-    "les correctifs via apply_settings, chacun justifie par une cause physique. "
-    "S'il n'y a rien d'ameliorable, dis-le et ne propose rien."
+    "Commence par get_slicing_status : s'il y a des warnings (level >= 1) ou une erreur, "
+    "leur resolution passe AVANT toute optimisation. Utilise get_model_info pour la "
+    "geometrie et get_settings pour la configuration, consulte get_setting_metadata avant "
+    "toute proposition. Cherche les reglages sous-optimaux (suretes, supports, temps, "
+    "temperature, vitesses...) et propose les correctifs via apply_settings, chacun "
+    "justifie par une cause physique. Apres chaque apply, verifie le nouveau verdict "
+    "via get_slicing_status (max 3 boucles). S'il n'y a rien d'ameliorable, dis-le."
 )
+
+# Objectifs presents a l'utilisateur avant l'automatisation : il les reordonne
+# (les fleches), le choix pondere toutes les decisions de l'agent.
+AUTO_OBJECTIVES = [
+    "Fiabilite (eliminer warnings et echecs)",
+    "Qualite d'impression",
+    "Rapidite (temps d'impression)",
+    "Moins de supports (matiere, nettoyage)",
+    "Economie de filament",
+    "Simplicite (rester proche des presets)",
+]
+
+
+def _auto_prompt_with_priorities(priorities, note=""):
+    prompt = AUTO_PROMPT + "\n\nPriorites de l'utilisateur, par ordre decroissant :"
+    for rank, item in enumerate(priorities or AUTO_OBJECTIVES, start=1):
+        prompt += "\n%d. %s" % (rank, item)
+    prompt += ("\nPese chaque decision selon cet ordre : un gain sur un objectif "
+               "bas ne vaut jamais une perte sur un objectif haut.")
+    if note and note.strip():
+        prompt += "\n\nPrecision de l'utilisateur : " + note.strip()
+    return prompt
 
 # Suite des instructions affichee a l'ouverture du mode Chatbot.
 WELCOME_TEXT = (
@@ -315,6 +339,16 @@ Tu disposes d'outils MCP (prefixe mcp__orca__) branches sur la session OrcaSlice
 - apply_settings : applique des reglages. L'utilisateur voit un diff et confirme.
 - rotate_objects : fait pivoter des objets du plateau (degres relatifs par axe,
   indices d'objets optionnels). L'utilisateur voit une carte et confirme.
+- get_slicing_status : verdict VIF du slicer — etat, erreur bloquante, warnings
+  (level 0=info, 1=warning, 2=error).
+
+Resolution automatique des warnings : apres CHAQUE apply_settings (qui declenche
+un reslice), rappelle get_slicing_status jusqu'a state 'completed'. Si des
+warnings de level >= 1 ou une erreur subsistent, diagnostique-les et propose le
+correctif suivant via apply_settings. Boucle au plus 3 corrections d'affilee,
+puis fais le point a l'utilisateur. Si l'etat reste 'slicing', re-interroge
+(plutot que d'attendre aveuglement). Ne propose jamais un correctif dont tu ne
+connais pas la cause physique.
 
 Methode de travail :
 1. Commence par LIRE la configuration reelle avant de conclure. Ne devine jamais une
@@ -387,6 +421,7 @@ class ClaudeSession:
             "mcp__orca__get_settings", "mcp__orca__get_setting_metadata",
             "mcp__orca__get_presets", "mcp__orca__get_model_info",
             "mcp__orca__apply_settings", "mcp__orca__rotate_objects",
+            "mcp__orca__get_slicing_status",
             # --restricted retire Bash, les outils qui executent du code et WebFetch.
             # Il est incompatible avec --permission-mode bypassPermissions ("not
             # supported in restricted mode") : --allowedTools suffit a pre-autoriser
@@ -633,6 +668,15 @@ PAGE = r"""
   .diff { border: 1px solid var(--orca-accent); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
   .diff h3 { margin: 0 0 8px; font-size: 12px; }
   .diff .row-check { accent-color: var(--orca-accent); }
+  /* cadrage du mode automatique : liste d'objectifs ordonnable */
+  .prio-list { margin: 8px 0; }
+  .prio-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .prio-rank { color: var(--orca-muted); min-width: 18px; text-align: right; font-size: 12px; }
+  .prio-name { flex: 1; font-size: 12px; }
+  .prio-row button {
+    padding: 2px 8px; font-size: 12px; border-radius: 6px;
+  }
+  .prio-note { width: 100%; margin-top: 6px; height: 40px; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--orca-border); vertical-align: top; }
   th { color: var(--orca-muted); font-weight: 500; }
@@ -926,6 +970,75 @@ PAGE = r"""
     log.appendChild(box); scroll();
   }
 
+  // Cadrage du mode Automatique : l'utilisateur ordonne ses objectifs avant
+  // que l'agent ne parte. L'ordre choisi pondere toutes les decisions.
+  function askAutoSetup(req) {
+    var box = document.createElement('div');
+    box.className = 'diff';
+    var h = document.createElement('h3');
+    h.textContent = 'Priorites de l\u2019optimisation (ordre decroissant)';
+    box.appendChild(h);
+    var intro = document.createElement('div');
+    intro.className = 'why';
+    intro.textContent = 'Reordonne avec les fleches, puis lance. Le haut de la liste pese le plus lourd.';
+    box.appendChild(intro);
+
+    var list = document.createElement('div');
+    var items = (req.objectives || []).map(function (label) {
+      var row = document.createElement('div');
+      row.className = 'prio-row';
+      var rank = document.createElement('span');
+      rank.className = 'prio-rank';
+      var name = document.createElement('span');
+      name.className = 'prio-name'; name.textContent = label;
+      var up = document.createElement('button'); up.textContent = '\u2191';
+      var down = document.createElement('button'); down.textContent = '\u2193';
+      function refresh() {
+        var rows = list.querySelectorAll('.prio-row');
+        for (var i = 0; i < rows.length; i++)
+          rows[i].querySelector('.prio-rank').textContent = (i + 1) + '.';
+      }
+      up.onclick = function () {
+        var prev = row.previousElementSibling;
+        if (prev) { list.insertBefore(row, prev); refresh(); }
+      };
+      down.onclick = function () {
+        var next = row.nextElementSibling;
+        if (next) { list.insertBefore(next, row); refresh(); }
+      };
+      row.appendChild(rank); row.appendChild(name); row.appendChild(up); row.appendChild(down);
+      list.appendChild(row);
+      return row;
+    });
+    box.appendChild(list);
+    (function refresh() {
+      var rows = list.querySelectorAll('.prio-row');
+      for (var i = 0; i < rows.length; i++)
+        rows[i].querySelector('.prio-rank').textContent = (i + 1) + '.';
+    })();
+
+    var note = document.createElement('textarea');
+    note.className = 'prio-note';
+    note.placeholder = 'Precision optionnelle (materiau, contrainte, deadline...)';
+
+    var actions = document.createElement('div');
+    actions.className = 'actions';
+    var go = document.createElement('button');
+    go.className = 'primary'; go.textContent = 'Lancer l\u2019analyse';
+    go.onclick = function () {
+      go.disabled = true;
+      var priorities = [];
+      list.querySelectorAll('.prio-name').forEach(function (n) { priorities.push(n.textContent); });
+      window.orca.postMessage({ command: 'auto_start', priorities: priorities,
+                                note: note.value || '' });
+    };
+    actions.appendChild(go);
+    box.appendChild(note);
+    box.appendChild(actions);
+    log.appendChild(box); scroll();
+    box.scrollIntoView({ behavior: 'smooth' });
+  }
+
   window.orca.onMessage(function (m) {
     if (!m || !m.command) return;
     switch (m.command) {
@@ -965,6 +1078,9 @@ PAGE = r"""
         break;
       case 'rotate_request':
         askRotate(m);
+        break;
+      case 'auto_setup':
+        askAutoSetup(m);
         break;
       case 'claude_status':
         hideBusy();
@@ -1097,13 +1213,22 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
     def _on_claude_ready(self):
         """Thread UI uniquement (execute ou aller-retour par la page)."""
         if self.AUTO:
-            self.post({"command": "info",
-                       "text": "Analyse automatique : piece + configuration. "
-                               "Les propositions arriveront dans une carte a cocher."})
-            self.post({"command": "busy", "text": "Analyse automatique en cours..."})
-            self._on_chat(AUTO_PROMPT)
+            # Phase de cadrage : l'utilisateur ordonne ses objectifs AVANT que
+            # l'agent ne parte (l'analyse demarre au message auto_start).
+            self.post({"command": "auto_setup", "objectives": list(AUTO_OBJECTIVES)})
         else:
             self.post({"command": "info", "text": WELCOME_TEXT})
+
+    def _on_auto_start(self, msg):
+        """Thread UI. Declenche l'analyse avec les priorites ordonnees."""
+        priorities = msg.get("priorities") or list(AUTO_OBJECTIVES)
+        prompt = _auto_prompt_with_priorities(priorities, msg.get("note", ""))
+        self.post({"command": "info",
+                   "text": "Analyse automatique lancee. Priorites : "
+                           + " > ".join(priorities[:3])
+                           + (" > ..." if len(priorities) > 3 else "")})
+        self.post({"command": "busy", "text": "Analyse automatique en cours..."})
+        self._on_chat(prompt)
 
     def _install_claude_worker(self):
         """Thread : installe claude-code puis rend compte via la page, qui
@@ -1178,6 +1303,9 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
                 # Aller-retour par la page : l'installation de claude-code vient
                 # de finir sur un thread, ce message nous ramene sur le thread UI.
                 self._on_claude_ready()
+            elif command == "auto_start":
+                # La page a rendu la liste d'objectifs ordonnee par l'utilisateur.
+                self._on_auto_start(msg)
         except Exception as exc:
             _log("on_message:", traceback.format_exc())
             self.post({"command": "error", "text": "%s: %s" % (type(exc).__name__, exc)})
@@ -1305,6 +1433,8 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
             return self._tool_apply(params)
         if method == "rotate_objects":
             return self._tool_rotate(params)
+        if method == "get_slicing_status":
+            return self._tool_slicing_status()
         raise ValueError("outil inconnu: %s" % method)
 
     def _tool_get_settings(self, params, snap):
@@ -1391,6 +1521,14 @@ class OrcaCopilot(orca.script.ScriptPluginCapabilityBase):
         with self._pending_lock:
             self._pending.pop(req_id, None)
         return entry["result"] or {"applied": False, "reason": "sans reponse"}
+
+    def _tool_slicing_status(self):
+        """Lecture VIVE (pas d'instantane) : le binding marshale lui-meme vers
+        le thread UI, donc l'appel est sur depuis le thread du pont."""
+        fn = getattr(orca.host, "slicing_status", None)
+        if fn is None:
+            raise RuntimeError("ce build n'expose pas orca.host.slicing_status")
+        return fn()
 
     def _tool_rotate(self, params):
         """Bloque le thread du pont jusqu'a la reponse de l'utilisateur sur la

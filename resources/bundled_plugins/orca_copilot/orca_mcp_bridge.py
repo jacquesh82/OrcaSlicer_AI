@@ -102,6 +102,16 @@ TOOLS = [
         },
     },
     {
+        "name": "get_slicing_status",
+        "description": (
+            "Verdict du slicer : etat ('idle', 'slicing', 'completed', 'error'), "
+            "erreur bloquante eventuelle, et warnings du G-code (level 0=info, "
+            "1=warning, 2=error). Lecture VIVE (hors instantane) : rappelle-la "
+            "apres un reslice jusqu'a 'completed'."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "rotate_objects",
         "description": (
             "Fait pivoter des objets du plateau (degres RELATIFS par axe, z etant la "

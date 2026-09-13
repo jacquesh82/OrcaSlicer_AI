@@ -1,8 +1,10 @@
 #include "PluginHostBindings.hpp"
+#include "PluginHostUiThread.hpp"
 #include "slic3r/plugin/PluginBindingUtils.hpp"
 
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Surface.hpp"
 #include "libslic3r/SurfaceCollection.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
@@ -10,8 +12,13 @@
 #include "libslic3r/Layer.hpp"      // LayerRegion, Layer, SupportLayer
 #include "libslic3r/Print.hpp"      // PrintRegion, PrintObject, Print
 
+#include <slic3r/GUI/BackgroundSlicingProcess.hpp>
+#include <slic3r/GUI/GUI_App.hpp>
+#include <slic3r/GUI/Plater.hpp>
+
 #include <pybind11/stl.h>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace py = pybind11;
@@ -63,6 +70,89 @@ static void refresh_lslices_bboxes(Layer& l)
 
 void host_bindings::register_slicing(py::module_& host)
 {
+    // ------------------------------------------------------------------
+    // orca.host.slicing_status() -- LIVE read of the slicer's own verdict:
+    // the blocking error when slicing failed, and the G-code processor's
+    // warnings once it completed. Unlike the print-graph bindings below (whose
+    // lifetime is pinned to a slicing-pipeline execute(ctx) call on the worker
+    // thread), this one marshals to the UI thread internally and is safe to
+    // call from ANY plugin thread, including an MCP bridge thread. The natural
+    // loop: apply_settings -> slicing runs -> poll until "completed" -> fix the
+    // remaining warnings.
+    // ------------------------------------------------------------------
+    struct StatusData
+    {
+        std::string state;   // "no_plater" | "idle" | "slicing" | "completed" | "error"
+        std::string error;   // blocking error, only when state == "error"
+        struct Warning
+        {
+            int                      level;       // 0 info, 1 warning, 2 error
+            std::string              msg;
+            std::string              error_code;
+            std::vector<std::string> params;
+        };
+        std::vector<Warning> warnings;
+    };
+
+    host.def("slicing_status", []() {
+        // Plain C++ inside the marshal: the GIL is released across
+        // run_on_ui_blocking (see PluginHostEdit's ApplyOutcome for why).
+        StatusData data = host_bindings::run_on_ui_blocking([]() -> StatusData {
+            StatusData out;
+            GUI::Plater* plater = GUI::wxGetApp().plater();
+            if (plater == nullptr) {
+                out.state = "no_plater";
+                return out;
+            }
+            BackgroundSlicingProcess& process = plater->background_process();
+            if (plater->is_background_process_slicing()) {
+                // Warnings below describe the LAST finished result; during a
+                // run they would be stale by definition.
+                out.state = "slicing";
+                return out;
+            }
+            // The blocking error of the last run, as remembered by the plater
+            // (the process itself only carries it inside its completion event).
+            if (!plater->last_slicing_error().empty()) {
+                out.state = "error";
+                out.error = plater->last_slicing_error();
+            } else {
+                out.state = process.finished() ? "completed" : "idle";
+            }
+            if (const GCodeProcessorResult* result = process.get_current_gcode_result()) {
+                for (const GCodeProcessorResult::SliceWarning& w : result->warnings) {
+                    StatusData::Warning item;
+                    item.level      = w.level;
+                    item.msg        = w.msg;
+                    item.error_code = w.error_code;
+                    item.params     = w.params;
+                    out.warnings.push_back(std::move(item));
+                }
+            }
+            return out;
+        });
+
+        // GIL held again: build the Python view.
+        py::dict out;
+        out["state"]         = data.state;
+        out["error"]         = data.error;
+        py::list warnings;
+        for (const StatusData::Warning& w : data.warnings) {
+            py::dict item;
+            item["level"]      = w.level;
+            item["message"]    = w.msg;
+            item["error_code"] = w.error_code;
+            item["params"]     = w.params;
+            warnings.append(item);
+        }
+        out["warnings"]      = warnings;
+        out["warning_count"] = data.warnings.size();
+        return out;
+    }, "Live slicing verdict: {state: 'idle'|'slicing'|'completed'|'error', error, "
+       "warnings: [{level: 0 info|1 warning|2 error, message, error_code, params}], "
+       "warning_count}. During a run the state is 'slicing' and the warnings are the "
+       "previous result's; poll until 'completed'. Safe from any plugin thread.");
+
     // ------------------------------------------------------------------
     // Slicing print-graph data model — raw bindings of the classes the C++
     // pipeline itself uses, same nodelete/reference style as the Model and

@@ -6728,6 +6728,10 @@ struct Plater::priv
     std::function<void(const wxString& pane_name)> m_plugin_pane_close_cb;
     bool                                           m_plugin_pane_close_bound{false};
 
+    // Last blocking slicing error (empty after a run that completed); exposed
+    // to plugins through Plater::last_slicing_error / orca.host.slicing_status.
+    std::string m_last_slicing_error;
+
     struct SidebarLayout
     {
         bool                  is_enabled{false};
@@ -12641,6 +12645,11 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         }
         has_error = true;
         is_finished = true;
+        // Remember the last blocking error for host-side reads
+        // (Plater::last_slicing_error -> orca.host.slicing_status).
+        m_last_slicing_error = message.first;
+    } else if (!evt.cancelled()) {
+        m_last_slicing_error.clear();
     }
     if (evt.cancelled()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", cancel event, status: %1%") % evt.status();
@@ -22495,4 +22504,6 @@ void Plater::set_plugin_pane_close_callback(std::function<void(const wxString& p
 {
     p->m_plugin_pane_close_cb = std::move(callback);
 }
+
+const std::string& Plater::last_slicing_error() const { return p->m_last_slicing_error; }
 }}    // namespace Slic3r::GUI

@@ -806,6 +806,10 @@ public:
     void set_bed_position(Vec2d& pos);
     //BBS: is the background process slicing currently
     bool is_background_process_slicing() const;
+
+    // Last blocking slicing error of the background process, empty when the
+    // last run completed. Consumed by the plugin host (slicing_status).
+    const std::string& last_slicing_error() const;
     //BBS: update slicing context
     void update_slicing_context_to_current_partplate();
     //BBS: show object info
